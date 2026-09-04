@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Dataset files must never be committed
+data/personal/*
+data/reference/*
+!data/personal/.gitkeep
+!data/reference/.gitkeep

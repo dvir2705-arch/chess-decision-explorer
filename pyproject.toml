@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chess-decision-explorer"
+version = "0.1.0"
+description = "Analyzes a player's Chess.com game history against a reference corpus of positions."
+requires-python = ">=3.10"
+dependencies = [
+    "chess",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
