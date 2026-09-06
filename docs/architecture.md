@@ -75,6 +75,58 @@ This keeps "what happened in the game" and "what it meant for this player's
 decision" as distinct concepts, so the same `GameResult` can yield different
 `Outcome`s depending on which side's decision is being evaluated.
 
+## Aggregation
+
+The aggregation layer folds already-normalized `DecisionObservation` objects
+into factual occurrence/outcome statistics. It records only what happened; it
+never decides whether a move is good or bad, and it computes no regret or
+quality metric.
+
+- **`occurrence_count` vs `distinct_game_count`.** `occurrence_count`
+  increments for every observation, including genuine repeats within one
+  game. `distinct_game_count` increments at most once per game for a given
+  position, and at most once per game for a given decision.
+
+- **Outcome counts are distinct-game based.** Each `PositionStats` and
+  `DecisionStats` holds an `OutcomeCounts` (wins / draws / losses) recorded
+  once per contributing game, so `wins + draws + losses == distinct_game_count`.
+  `score_rate` is derived (`(wins + 0.5 * draws) / game_count`) and is `None`
+  when no games were recorded.
+
+- **Choice rate is occurrence based.** `PositionStats.choice_rate(move)` is
+  `decision occurrence_count / position occurrence_count`, or `0.0` for a move
+  never seen in that position. Choice rates over all of a position's moves sum
+  to approximately 1.0.
+
+- **Repeated positions may create multiple decision-level game counts in one
+  position-level game.** If a game reaches position P twice and plays a
+  different move each time, P gets `distinct_game_count += 1` but each of the
+  two decisions also gets `distinct_game_count += 1`. The sum of a position's
+  decision `distinct_game_count` values is therefore not required to equal the
+  position `distinct_game_count`. The sum of decision `occurrence_count` values
+  for a position always equals the position `occurrence_count`.
+
+- **Game-ID sets are temporary.** `PositionIndex.add_game` uses per-call
+  temporary sets to gate the once-per-game increments and discards them when
+  the call returns. No sets of game IDs are stored in `PositionStats` or
+  `DecisionStats`. `add_game` rejects an empty observation collection, rejects
+  observations with differing `game_id`, and rejects a game where the same
+  position or the same decision appears with conflicting `Outcome` values. The
+  decision-level conflict check runs before the position-level one, so a
+  repeated identical decision reports the decision conflict rather than the
+  position conflict; all consistency checks complete before any state is
+  mutated.
+
+- **Cross-call game uniqueness is not the index's job.** `PositionIndex`
+  keeps no record of previously submitted `game_id`s and assumes each logical
+  `game_id` is passed to `add_game` at most once. Preventing duplicate
+  ingestion of the same game across calls belongs to the future
+  ingestion/corpus layer, not to this index.
+
+- **One generic index.** There is a single `PositionIndex` implementation.
+  Personal and reference populations use separate instances of it; there are
+  no distinct personal/reference index classes.
+
 ## Out of scope for now
 
 The following are known future directions but are explicitly not part of
