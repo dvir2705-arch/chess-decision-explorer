@@ -2,11 +2,13 @@
 
 ## Current Phase
 
+Step 2 complete — aggregation layer.
+
 Step 1 complete — chess domain value objects.
 
 ## Last Approved Code Commit
 
-`d6c8cbc` — `feat: add chess domain value objects`
+`ffb47c8` — `feat: add position aggregation layer`
 
 ## Completed
 
@@ -19,7 +21,16 @@ Step 1 complete — chess domain value objects.
   - Outcome
   - DecisionObservation
 - Position identity uses python-chess EPD with legal en-passant normalization.
-- 25 tests currently pass.
+- Step 2: aggregation layer:
+  - `OutcomeCounts`, `DecisionStats`, `PositionStats`
+  - one generic `PositionIndex` with a game-oriented `add_game` API
+  - occurrence_count vs distinct_game_count
+  - distinct-game-based outcome counting
+  - occurrence-based choice rate
+  - atomic outcome-consistency validation (all checks pass before any
+    mutation; decision conflict reported before position conflict)
+  - no permanent storage of game IDs
+- The complete test suite currently has 41 passing tests.
 
 ## Core Product Direction
 
@@ -49,32 +60,24 @@ Opening identity must remain separate from PositionKey.
 
 ## Current Design Boundary
 
-Aggregation has NOT been designed or implemented yet.
+Aggregation is implemented and approved (see the Aggregation section of
+`docs/architecture.md`).
 
-No current implementation exists for:
+Still not designed or implemented:
 
-- PositionStats
-- DecisionStats
-- occurrence aggregation
-- distinct-game counting
-- personal choice rate
-- reference statistics
-- regret
-- Top-K ranking
+- Chess.com / PGN ingestion
+- reference-corpus ingestion
+- cohort filtering
+- Stockfish integration
+- regret calculation
+- Top-K weakness ranking
+- opening classification
+- visual/training UI
+
+Preventing cross-call duplicate ingestion of the same game is the
+responsibility of the future ingestion/corpus layer, not `PositionIndex`.
 
 ## Next Step
 
-Step 2 will first DESIGN aggregation semantics before implementation.
-
-Questions to resolve include:
-
-- occurrence_count vs distinct_game_count
-- repeated positions within one game
-- position-level vs decision-level aggregation
-- what data must be stored vs derived
-- preparation for later reference cohorts and Stockfish without prematurely
-  adding them
-
-## Working State
-
-Expected Git working tree before Step 2: clean.
+Step 3 has not yet been designed. Architecture discussion with Dvir and the
+project reviewer is required before implementation.
