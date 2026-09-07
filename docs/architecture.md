@@ -127,6 +127,52 @@ quality metric.
   Personal and reference populations use separate instances of it; there are
   no distinct personal/reference index classes.
 
+## PGN parsing and personal decision extraction
+
+Parsing a local PGN file and turning it into domain objects is a separate
+concern from both the domain value objects and the aggregation layer.
+
+- **`GameRecord`** — a source-neutral, immutable representation of one parsed
+  standard-chess game: the two player names (spelling and case preserved),
+  optional ratings, raw `GameResult`, optional `time_control` / `date` /
+  `site`, the complete `initial_fen` the game replays from, and the PGN main
+  line as a tuple of moves. Optional metadata is only lightly normalised:
+  meaningful values are preserved as trimmed source text (ratings as `int`),
+  while absent, blank, or conventional unknown markers (`?`, `-`,
+  `????.??.??`) become `None` and a clearly malformed rating is rejected. It
+  is otherwise not interpreted, classified, or filtered — ratings are not
+  turned into cohorts, `time_control` is not labelled blitz/rapid. No
+  opening/ECO fields.
+
+- **PGN parsing is streaming.** `iter_pgn_records(handle, source_id)` reads
+  one game at a time from the handle rather than loading the whole file.
+
+- **`game_id` for local sources is `f"{source_id}:{ordinal}"`**, where the
+  ordinal is zero-based and advances once per parsed game. Identity is not
+  derived from player names or date. Preventing duplicate ingestion of the
+  same game across sources or across calls remains a future
+  ingestion/corpus responsibility, not the parser's.
+
+- **Malformed or unfinished games are rejected, not partially indexed.** A
+  game is rejected (`ValueError`) if python-chess reports parsing errors, if
+  the result is not one of `1-0` / `0-1` / `1/2-1/2` (so `*` is rejected), if
+  it uses an unsupported variant or Chess960, or if a rating header is
+  clearly non-numeric. A legal custom starting position is preserved through
+  `initial_fen`. Only the main line is consumed; comments, annotations and
+  side variations are ignored.
+
+- **Decision extraction is separate from parsing.**
+  `extract_player_observations(game, player_name)` replays the game from
+  `initial_fen` and emits `DecisionObservation` objects for only the
+  requested player's turns. Player matching is case-insensitive
+  (`casefold()`); a player who is neither side, or an ambiguous identity, is
+  rejected. For each ply where the side to move is the requested player, the
+  position is captured *before* the move is pushed, `ply_index` is the
+  zero-based half-move index, and the observation's `Outcome` is the game's
+  final result normalised to that player's colour. Every move is checked for
+  legality during replay; if replay cannot complete, the call raises rather
+  than returning partial observations. Aggregation is not performed here.
+
 ## Out of scope for now
 
 The following are known future directions but are explicitly not part of
