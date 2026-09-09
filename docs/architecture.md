@@ -173,6 +173,87 @@ concern from both the domain value objects and the aggregation layer.
   legality during replay; if replay cannot complete, the call raises rather
   than returning partial observations. Aggregation is not performed here.
 
+## Personal cohort analysis
+
+Turning a stream of `GameRecord` objects into the player's own analysis is a
+separate concern again, living in `personal.py`. It never changes the
+semantics of `domain.py`, `aggregation.py`, or `ingestion.py`, and
+`PositionIndex` stays completely unaware of rating and time control.
+
+- **Time-control classification.** A raw PGN `TimeControl` value is mapped to
+  a `TimeControlCategory` (`RAPID` / `BLITZ` / `BULLET` / `UNKNOWN`) using
+  Chess.com's estimated-duration model:
+
+  `estimated_seconds = base_seconds + 40 * increment_seconds`
+
+  Boundaries: `< 180` → BULLET, `180 <= t < 600` → BLITZ, `t >= 600` → RAPID.
+  Only plain `integer` or `integer+integer` strings are recognised; `None`,
+  blank, and any other shape (correspondence/daily, `-`, ...) is `UNKNOWN`.
+  Classification never guesses and never raises on merely unsupported values.
+
+- **Personal rating means the actor's own rating in that game** — the White
+  rating when the player was White, the Black rating when Black. It is not a
+  peak rating or an external rating.
+
+- **`PersonalGameContext`** bundles the resolved `player_color`, that side's
+  `personal_rating` (or `None`), and the `time_control_category`. Player
+  matching is case-insensitive (`casefold()`); a name matching neither side
+  or both sides is rejected.
+
+- **v1 eligibility policy (`PersonalAnalysisPolicy`).** Thresholds are
+  configuration, not scattered constants, and may change in a later version:
+
+  - Rapid minimum rating `>= 800`
+  - Blitz minimum rating `>= 501`
+  - Bullet minimum rating `>= 600`
+
+  The product decision for Blitz is "> 500"; the implementation keeps the
+  uniform `rating >= minimum` rule, so the configured Blitz minimum is 501.
+  Each threshold is validated at construction as a non-negative `int`
+  (`bool` and other non-`int` types are rejected with `ValueError`); values
+  are validated, never coerced. The policy stays frozen and slotted.
+
+- **`GameDisposition`** is the initial eligibility outcome: `CORE`, `LEGACY`,
+  `MISSING_RATING`, `UNKNOWN_TIME_CONTROL`. Order of decision: unknown time
+  control first, then missing rating, then rating vs. the category threshold
+  (`>=` → CORE, else LEGACY). `zero_decision` is **not** a disposition — it is
+  a downstream status a game can only reach *after* it has been classified
+  CORE and then produced no personal decisions.
+
+- **Separate indexes per category.** Rapid, Blitz, and Bullet each get their
+  own `PositionIndex` and `CohortStats`; the indexes are never merged and
+  there is no combined all-core index. A position is present in a cohort's
+  index only if a game of that cohort contributed it. LEGACY, missing-rating,
+  and unknown-time-control games never reach any `PositionIndex`.
+
+- **Accounting invariants.** For a known category:
+
+  `games_seen == core_eligible_games + legacy_games + missing_rating_games`
+  `core_eligible_games == indexed_games + zero_decision_games`
+
+  `personal_decisions` is the number of `DecisionObservation` objects actually
+  inserted into that cohort's index; a zero-decision CORE game adds nothing to
+  it and is not counted as indexed. UNKNOWN-time-control games are accumulated
+  in a separate `CohortStats` with no index, where only `games_seen` and
+  `unknown_time_control_games` advance (in lockstep) — the documented
+  exception to the first invariant. Dataset-level totals are always derived
+  from the per-cohort stats, never stored separately, so they cannot drift.
+
+- **CORE processing is per-game transactional with respect to `CohortStats`.**
+  For a CORE game every step that can raise — observation extraction, and
+  `PositionIndex.add_game` when there are observations — runs before any
+  counter is touched. A game that fails during extraction contributes
+  nothing; a game that fails during indexing contributes nothing to
+  `CohortStats` (and `PositionIndex` remains atomic in its own right); a
+  zero-decision CORE game is accounted only after a successful extraction;
+  the indexed counters are committed only after a successful
+  `PositionIndex.add_game`. LEGACY, missing-rating, and unknown-time-control
+  games do no downstream work and keep simple immediate accounting.
+
+- **Raw data is never deleted because of cohort filtering.** Cohort
+  classification only decides what feeds which index; the underlying
+  `GameRecord` stream and any stored PGN files are untouched.
+
 ## Out of scope for now
 
 The following are known future directions but are explicitly not part of

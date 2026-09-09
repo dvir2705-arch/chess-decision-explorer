@@ -2,6 +2,13 @@
 
 ## Current Phase
 
+Step 3C complete and approved — personal analysis cohorts (`personal.py`):
+time-control classification, validated immutable analysis policy,
+disposition classification, and separate Rapid / Blitz / Bullet CORE
+position indexes with per-game transactional accounting.
+
+Step 3B complete — real-data smoke test passed successfully.
+
 Step 3A complete — local PGN parsing and personal decision extraction.
 
 Step 2 complete — aggregation layer.
@@ -10,7 +17,9 @@ Step 1 complete — chess domain value objects.
 
 ## Last Approved Code Commit
 
-`a6e0590` — `feat: add local PGN ingestion and decision extraction`
+`feat: add personal analysis cohorts` — Step 3C, approved after
+architectural review (supersedes `a6e0590 feat: add local PGN ingestion and
+decision extraction`).
 
 ## Completed
 
@@ -55,7 +64,43 @@ Step 1 complete — chess domain value objects.
   - complete replay validation before any observations are returned (raise or
     full list, never partial)
   - extracted observations integrate directly with `PositionIndex.add_game`
-- The complete test suite currently has 75 passing tests.
+- Step 3B: real-data smoke test completed successfully:
+  - observed raw personal dataset: 5128 games across 60 completed monthly
+    PGN files
+  - raw personal data remains outside Git
+  - real-data edge case: 4 games have zero personal decisions overall, and
+    only 1 of those 4 falls inside the current Rapid CORE cohort
+- Step 3C: personal analysis cohorts in `personal.py` (complete and
+  approved):
+  - `TimeControlCategory` (RAPID / BLITZ / BULLET / UNKNOWN) classified via
+    the Chess.com estimated-duration model
+    (`base_seconds + 40 * increment_seconds`); non-`int`/`int+int` values
+    (including correspondence/daily) are `UNKNOWN`, never guessed or raised on
+  - `PersonalGameContext` + `resolve_personal_game_context` — actor's own
+    colour, that side's own rating, and the game's category; case-insensitive
+    matching, absent/ambiguous player rejected
+  - `PersonalAnalysisPolicy` — immutable (frozen + slotted) v1 policy,
+    thresholds Rapid >= 800 / Blitz >= 501 / Bullet >= 600, each validated at
+    construction as a non-negative `int` (no coercion; `bool` rejected)
+  - `GameDisposition` (CORE / LEGACY / MISSING_RATING / UNKNOWN_TIME_CONTROL);
+    zero-decision is a downstream status, not a disposition
+  - separate CORE `PositionIndex` per time-control category (Rapid / Blitz /
+    Bullet); no combined all-core index; `PositionIndex` stays rating- and
+    time-control-agnostic
+  - `CohortStats` per category and `DatasetTotals` derived from the per-cohort
+    stats (never stored twice)
+  - zero-decision accounting: a CORE game with no personal decisions is
+    counted as `zero_decision` and is not indexed
+  - `build_personal_analysis(games, player_name, policy)` — source-independent;
+    CORE accounting is per-game transactional: extraction and, when there are
+    observations, `PositionIndex.add_game` run before any `CohortStats`
+    counter is committed, so a CORE game that fails downstream contributes
+    nothing
+  - raw data is never deleted by cohort filtering
+  - `domain.py`, `aggregation.py`, `ingestion.py` unchanged
+- The complete test suite has 138 passing tests
+  (75 prior + 63 for Step 3C), plus one known unrelated python-chess
+  `chess.engine` deprecation warning.
 
 ## Core Product Direction
 
@@ -91,11 +136,19 @@ Aggregation is implemented and approved (see the Aggregation section of
 Local PGN parsing and personal decision extraction are implemented and
 approved (see the PGN parsing section of `docs/architecture.md`).
 
+Personal cohort analysis is implemented and approved (see the Personal
+cohort analysis section of `docs/architecture.md`): time-control
+classification, validated `PersonalAnalysisPolicy` thresholds,
+CORE/LEGACY/missing/unknown disposition, per-game transactional CORE
+accounting, and separate per-cohort `PositionIndex` instances for
+Rapid / Blitz / Bullet.
+
 Not implemented:
 
 - Chess.com network/API ingestion
 - reference-corpus ingestion
-- cohort filtering
+- rating bands inside CORE
+- legacy / combined PositionIndexes
 
 Remaining future work: Stockfish integration, regret calculation, Top-K
 weakness ranking, opening classification, visual/training UI.
@@ -111,6 +164,10 @@ source ordinal so that game identity stays reproducible.
 
 ## Next Step
 
-Step 3B has not yet been implemented. It will be designed with Dvir and the
-project reviewer before any Chess.com network access or real-data download is
-added.
+Step 3C is complete and approved. Step 4 has not started.
+
+The next step is architectural planning only — to be designed with Dvir and
+the project reviewer before any implementation. No Step 4 architecture has
+been decided yet. Stockfish, reference-corpus ingestion, regret / Top-K
+ranking, opening classification, persistence, and UI all remain out of scope
+until explicitly planned and approved.
