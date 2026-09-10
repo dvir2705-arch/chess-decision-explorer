@@ -28,9 +28,18 @@ is defined by:
 - castling rights
 - relevant en-passant state
 
-Halfmove clock and fullmove number are explicitly excluded from this
-identity, since they do not affect the strategic content of a position but
-would otherwise cause identical positions to be treated as different.
+Halfmove clock, fullmove number, and prior repetition history are
+deliberately excluded from this identity because its role is
+*recurring-position identity*: including them would cause the same recurring
+position to be treated as many different ones. This exclusion is a scoping
+choice, not a claim that those dimensions are irrelevant. Halfmove clock,
+fullmove number, and repetition history can affect the *exact game-state
+evaluation* of a single occurrence through draw-rule context (the
+50-/75-move rule and threefold/fivefold repetition). Step 4A intentionally
+evaluates a canonical recurring position (`CANONICAL_POSITION_V1`) rather
+than reproducing the exact historical draw context of each occurrence; a
+future exact-historical evaluation mode may handle that separately, without
+changing `PositionKey`.
 
 ## 4. The analysis core is independent of interfaces
 
@@ -254,12 +263,264 @@ semantics of `domain.py`, `aggregation.py`, or `ingestion.py`, and
   classification only decides what feeds which index; the underlying
   `GameRecord` stream and any stored PGN files are untouched.
 
+## Engine evaluation (Step 4A)
+
+Stockfish is an external UCI dependency: the executable is never bundled
+into the repository, and production code always receives its path through
+configuration/construction (`StockfishEvaluator(executable_path, config)`),
+never a hard-coded location. The process is not started until an explicit
+`start()` call (or entering the evaluator as a context manager) -- never at
+import time.
+
+At startup the caller-supplied executable reference is resolved once
+(`resolve_executable()`) to a single concrete filesystem path: an absolute
+path or a relative path with a separator is taken as a filesystem location
+and made absolute; a bare command name is looked up on `PATH` via
+`shutil.which`; anything that does not resolve to an existing file fails
+loudly with `EngineStartupError`. That one resolved path is used for *both*
+hashing the executable and launching it, so the hashed bytes and the
+launched process can never disagree. The resolved path itself is an
+operational detail and is still excluded from semantic cache identity; the
+executable SHA-256 remains the content identity.
+
+### Canonical position semantics (`CANONICAL_POSITION_V1`)
+
+Step 4A evaluates **canonical recurring decision positions**, not exact
+historical occurrences. `POSITION_SEMANTICS_VERSION = "CANONICAL_POSITION_V1"`
+names this contract:
+
+- standard chess; the canonical four-field `PositionKey` (piece placement,
+  side to move, valid castling rights, legally relevant en-passant);
+- `halfmove_clock` reset to 0 and `fullmove_number` reset to 1;
+- an empty pre-root move history;
+- evaluation normalized to the root side to move.
+
+It deliberately does **not** reproduce the original halfmove clock, the
+original fullmove number, prior repetition history, or the exact historical
+50-/75-move or threefold/fivefold state of any single occurrence. The
+product question is *"how should this recurring canonical position be
+played?"*, not *"what was the exact draw-rule context of one historical
+occurrence?"*. A future **exact-historical evaluation mode** would be a
+separate mode with its own identifier; the replayable Step 3 ingestion
+model already preserves enough source information to add it later.
+
+### Centralized request validation
+
+`validate_request()` is the one authoritative validation path, run before
+every cache lookup and every engine analysis (from `EvaluationRequest`
+construction and again inside `StockfishEvaluator.evaluate()`), so the two
+agree exactly. A valid Step 4A request requires:
+
+- **Representation** -- a bare four-field EPD with no operation suffixes
+  (`hmvc`/`fmvn` rejected); reconstructing the board and re-deriving the key
+  must round-trip to the supplied `PositionKey`.
+- **Board validity** -- the board must pass python-chess validity checks;
+  structurally invalid boards are rejected before any cache or engine use.
+- **Search mode** -- only `UNRESTRICTED` or `FORCED_MOVE`; an unknown mode
+  is rejected, never treated as unrestricted.
+- **Terminal canonical positions are not decision points** -- checkmate,
+  stalemate, and python-chess-recognized insufficient material are
+  rejected. History-dependent draw claims (50-/75-move, threefold/fivefold)
+  are *not* checked: that history is intentionally excluded from
+  `CANONICAL_POSITION_V1`.
+- **Forced move** -- `FORCED_MOVE` requires a legal root move; `UNRESTRICTED`
+  forbids one.
+
+An invalid request raises `RequestValidationError` (a `ValueError`) before
+any cache lookup.
+
+### Engine identity
+
+`EngineIdentity` carries:
+
+- `name` -- the UCI `id name`, kept for provenance;
+- `executable_sha256` -- SHA-256 of the actual Stockfish executable bytes,
+  hashed with chunked/streaming reads (the ~100 MB binary is never loaded
+  whole). This is the authoritative content identity for the current
+  official Stockfish binary / default-network configuration and provides
+  accidental-staleness protection.
+- `eval_file` -- the engine's reported default `EvalFile`, kept only as
+  network provenance.
+
+The executable **path** is never part of identity. Step 4A does not support
+caller-selected external NNUE files; the evaluator always uses Stockfish's
+default network. **Future boundary:** if a later version allows an
+externally supplied NNUE network, the content digest of that network MUST
+become part of engine identity before persistent caching is allowed for
+that configuration.
+
+### Fixed analysis profile
+
+`ANALYSIS_PROFILE` is the single authoritative definition of Step 4A's
+fixed, analysis-affecting engine policy: single-PV analysis, Skill Level 20,
+`UCI_LimitStrength=false`, `UCI_ShowWDL=true`, standard chess, no Syzygy
+tablebases, node-limited search, fresh independent search state, no
+pondering. `Threads` and `Hash` are separate `EngineAnalysisConfig`
+dimensions and are not duplicated in the profile.
+
+`ANALYSIS_PROFILE_FINGERPRINT` is a deterministic SHA-256 over the canonical
+(sorted-key, no-whitespace) JSON serialization of the profile -- never
+`hash()`, object identity, `pickle`, or unordered `repr`. It changes
+whenever a fixed analysis-affecting policy changes.
+`StockfishEvaluator.start()` configures the engine from this same profile
+definition (via `_profile_uci_configuration`). **`MultiPV` is never passed
+to `SimpleEngine.configure()`** -- python-chess manages MultiPV itself and
+rejects the managed option; Step 4A uses the ordinary single-PV analyse
+path, and the profile records `single_pv: true` as the semantic fact.
+
+### Engine-evidence contract (`ENGINE_EVIDENCE_V1`)
+
+`ENGINE_EVIDENCE_VERSION = "ENGINE_EVIDENCE_V1"` identifies how raw
+Stockfish output is accepted and interpreted. It participates in persistent
+cache identity and is a **separate concept from the SQLite storage schema
+version**. A response is accepted only if it is complete and
+comparison-ready:
+
+- root-side-to-move POV normalization (via `PovScore.pov()` /
+  `PovWdl.pov()`, never raw `.relative`);
+- an exact score is present -- `lowerbound` / `upperbound` results are
+  rejected. A hard node budget can stop Stockfish mid-aspiration, leaving
+  the final emitted line bounded. `_analyse_exact()` streams the analysis
+  and examines each individual analysis report as it arrives: it rejects
+  any bounded report as comparison-ready evidence and retains the **last**
+  suitable unbounded scored report that carries the required
+  evidence/PV. It does **not** explicitly select the report with maximum
+  depth; when the search terminates during a later bounded aspiration
+  re-search, the retained report may therefore be an earlier (shallower)
+  one. The evaluator never repairs a bound line, and fails loudly if the
+  engine produced no suitable unbounded scored report;
+- engine-reported WDL is present, non-negative, and sums to exactly 1000
+  (Stockfish scale);
+- `depth` and `nodes` are present;
+- the principal variation is non-empty (every Step 4A position is a
+  validated nonterminal decision position), every PV move is legal when
+  replayed sequentially from the canonical root, and a `FORCED_MOVE` PV
+  begins with the forced root move;
+- `mate=0` at the root is inconsistent with a validated nonterminal
+  position and is rejected.
+
+Malformed engine evidence is never silently repaired.
+
+- **CP vs mate.** Exactly one of `centipawn` / `mate` is set; a mate is
+  never encoded as a large centipawn number, and integer `mate=0` is
+  represented faithfully (never confused with "unset"). Both CP/mate and
+  WDL are kept.
+
+- **`nodes` semantics.** `EngineEvaluation.nodes` is the engine node
+  counter as reported *on the retained comparison-ready report* (see
+  `_analyse_exact()` above). It is **not** guaranteed to equal the total
+  number of nodes Stockfish consumed before the overall `analysis()` call
+  terminated: when a later bounded aspiration re-search runs after the
+  retained report and is then cut off by the node budget, the retained
+  report's counter is lower than the true total. Future Step 4B must not
+  interpret `EngineEvaluation.nodes` (or the L2 `actual_nodes` column that
+  stores it) as total computational expenditure.
+
+- **Engine-model expected score.** `EngineEvaluation.expected_score` is
+  `(wins + 0.5 * draws) / 1000` from the root side to move's POV. This is
+  the **engine-model expected score**. It is *not* the user's personal win
+  probability, a human win probability at a given rating, or a
+  time-control-adjusted probability.
+
+- **Controlled fresh search state.** Each independent analysis passes a
+  fresh sentinel as python-chess's `game` marker, so python-chess sends
+  `ucinewgame` through the supported UCI lifecycle before the search; one
+  evaluation never inherits another's transposition-table state without
+  restarting the process. `Threads` defaults to 1. No claim is made of
+  bit-for-bit reproducibility across machines or builds. A cache hit never
+  invokes `analyse()`.
+
+### Semantic cache key
+
+Both L1 and L2 key on the same `SemanticCacheKey`, so optional identity
+fields (absent root move, absent eval file) normalize to the same sentinel
+(`""`) in both layers -- `None` and `""` never diverge. The key spans:
+
+`position_semantics_version`, canonical `PositionKey` (EPD), `SearchMode`,
+root move (or `""` sentinel for unrestricted), engine executable SHA-256,
+engine UCI name, reported default `EvalFile` (or `""`), requested `nodes`,
+`threads`, `hash_mb`, `analysis_profile_fingerprint`, and
+`evidence_contract_version`.
+
+The executable path, and any rating / time-control / source / opening /
+user-identity dimension, are deliberately excluded: Stockfish's evaluation
+of a position does not depend on where the position came from. The engine
+layer (`engine.py`, `engine_cache.py`) does not import from `personal.py`.
+
+### L1 memory + L2 SQLite
+
+- `InMemoryEvaluationCache` -- plain dict keyed on `SemanticCacheKey`, no
+  persistence, no global singleton.
+- `SQLiteEvaluationCache` -- standard-library `sqlite3`, caller-provided
+  path. Every primary-key column is `NOT NULL`; low-complexity `CHECK`
+  constraints cover search-mode/root-move consistency, centipawn/mate
+  exclusivity, non-negative WDL, WDL total = 1000, and non-negative
+  depth/nodes. Python reconstruction re-validates every row regardless of
+  the SQL constraints.
+- `TieredEvaluationCache` -- L1-then-L2 get with L1 repopulation on an L2
+  hit; **L2-then-L1 put**, so if the persistent write raises (a conflict,
+  or corrupt existing data) L1 is never populated with a value L2 does not
+  hold.
+- `CachedEvaluator` -- builds (and therefore validates) the
+  `EvaluationRequest` before consulting the cache, checks the cache, and
+  invokes Stockfish only on a miss; a failed evaluation is never cached.
+
+### Checked SQLite schema versioning
+
+`SQLITE_SCHEMA_VERSION = 2`, stored in `PRAGMA user_version`. The cache is
+disposable computed data, so there are **no migrations**:
+
+- fresh database (`user_version == 0`, no user tables) -> create the
+  current schema, set the current version;
+- database already at the supported version -> open normally;
+- database at any other non-zero version -> fail with
+  `CacheSchemaError` explaining that this is disposable computed cache data
+  and should be deleted and rebuilt;
+- `user_version == 0` but user tables already present -> fail with
+  `CacheSchemaError` rather than initializing over unknown data.
+
+The database is never automatically deleted, and incompatible data is never
+silently relabelled.
+
+### Immutable persistent entries; loud corruption
+
+Completed engine evidence for one semantic key is immutable derived data.
+`SQLiteEvaluationCache.put()` uses a plain `INSERT`:
+
+- key absent -> insert;
+- key present with the **same** evaluation -> idempotent no-op;
+- key present with a **different** evaluation -> `CacheIntegrityError`; the
+  existing row is never overwritten.
+
+On read, `pv_json` must decode to a JSON **list of UCI strings**; the row is
+reconstructed into an `EngineEvaluation` and re-validated against the
+`EvaluationRequest`. Malformed JSON, the wrong JSON shape, invalid UCI
+moves, an invalid CP/mate or WDL state, or any request/evidence mismatch
+raises `CacheIntegrityError` -- persistent corruption fails loudly and is
+never turned into a silent cache miss or a repaired value.
+
+### Not part of Step 4A
+
+- **Step 4A does not define EngineRegret or a mistake/damage threshold.**
+  That, along with MultiPV-based move recommendations and any acceptable-move
+  classification, remains future work. `UNRESTRICTED` records the engine's
+  selected root candidate as evidence; it is not labelled "the only correct
+  move".
+- **Opening/variation classification** is history/context metadata about how
+  a position was reached, and must remain separate from `PositionKey`,
+  because transpositions can reach the same position through different
+  openings.
+- Invalid custom-PGN initial-position validation is noted as possible
+  future ingestion hardening; Step 4A does not reopen Step 3 architecture.
+
 ## Out of scope for now
 
 The following are known future directions but are explicitly not part of
 the current foundation and have no design yet:
 
-- Stockfish evaluation
+- EngineRegret / mistake-threshold analysis
+- Reference-corpus (Lichess) ingestion
+- Opening classification
 - Parallel processing
-- Databases
+- A persistent database beyond the disposable engine evaluation cache
 - A web-based visual interface

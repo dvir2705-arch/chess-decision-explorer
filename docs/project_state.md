@@ -2,10 +2,18 @@
 
 ## Current Phase
 
-Step 3C complete and approved — personal analysis cohorts (`personal.py`):
-time-control classification, validated immutable analysis policy,
-disposition classification, and separate Rapid / Blitz / Bullet CORE
-position indexes with per-game transactional accounting.
+Step 4A is COMPLETE and architecturally APPROVED — Stockfish engine
+foundation and a persistent two-level evaluation cache (`engine.py`,
+`engine_cache.py`). Two independent architecture audits reviewed it: the
+first drove the audit-correction pass, and the second approved the revised
+Step 4A for its documented scope with no remaining P0 blockers. This
+checkpoint commit records that approved state.
+
+Step 3C remains complete and approved at commit `447fdb1` — personal
+analysis cohorts (`personal.py`): time-control classification, validated
+immutable analysis policy, disposition classification, and separate Rapid /
+Blitz / Bullet CORE position indexes with per-game transactional
+accounting.
 
 Step 3B complete — real-data smoke test passed successfully.
 
@@ -17,9 +25,9 @@ Step 1 complete — chess domain value objects.
 
 ## Last Approved Code Commit
 
-`feat: add personal analysis cohorts` — Step 3C, approved after
-architectural review (supersedes `a6e0590 feat: add local PGN ingestion and
-decision extraction`).
+`feat: add stockfish evaluation foundation` — Step 4A, approved after two
+independent architecture audits (this checkpoint commit; supersedes
+`447fdb1 feat: add personal analysis cohorts`, Step 3C).
 
 ## Completed
 
@@ -98,9 +106,123 @@ decision extraction`).
     nothing
   - raw data is never deleted by cohort filtering
   - `domain.py`, `aggregation.py`, `ingestion.py` unchanged
-- The complete test suite has 138 passing tests
-  (75 prior + 63 for Step 3C), plus one known unrelated python-chess
-  `chess.engine` deprecation warning.
+- Step 4A (COMPLETE, architecturally APPROVED): Stockfish engine foundation
+  and a persistent two-level evaluation cache (`engine.py`,
+  `engine_cache.py`).
+  A first independent architecture/correctness audit found real
+  engine-integration and cache-correctness issues (an invalid `MultiPV`
+  passed to `configure()`; leniently accepted engine output; `PRAGMA
+  user_version` rewritten on every open; `INSERT OR REPLACE` cache writes;
+  no request-aware evidence validation); those corrections were applied. A
+  second independent audit then approved the revised Step 4A for its
+  documented scope with no remaining P0 blockers, and a final pre-commit
+  polish pass corrected the decision-3 canonical-position wording,
+  documented `_analyse_exact()` / `EngineEvaluation.nodes` precisely, and
+  added one-time executable-path resolution (`resolve_executable()`) so the
+  hashed bytes and the launched process cannot disagree.
+  - `CANONICAL_POSITION_V1` — Step 4A evaluates canonical recurring decision
+    positions: canonical four-field `PositionKey`, `halfmove_clock`/
+    `fullmove_number` reset to 0/1, empty pre-root history, evaluation
+    normalized to the root side to move. Exact-historical draw/repetition
+    context is intentionally excluded and left to a future separate mode.
+  - `validate_request()` — one authoritative validation path used before
+    every cache lookup and every analysis (rejects EPD operation suffixes,
+    non-round-tripping keys, structurally invalid boards, checkmate/
+    stalemate/insufficient-material, unknown search modes, and illegal or
+    missing/forbidden root moves); `EvaluationRequest` and
+    `StockfishEvaluator` route through it and agree exactly
+  - `EngineIdentity` — UCI `id name` (provenance) + **SHA-256 of the
+    executable bytes** (chunked/streaming hash) + reported default
+    `EvalFile` (provenance). Executable path is never identity; external
+    NNUE networks are unsupported in Step 4A and would require network
+    content identity before persistent caching
+  - `ANALYSIS_PROFILE` + `ANALYSIS_PROFILE_FINGERPRINT` — one authoritative
+    fixed profile (single-PV, Skill Level 20, `UCI_LimitStrength` off,
+    `UCI_ShowWDL` on, standard chess, no Syzygy, node-limited, fresh search
+    state, no ponder); deterministic SHA-256 over canonical JSON;
+    `start()` configures from the same definition; **`MultiPV` is never
+    sent to `configure()`** (python-chess manages it)
+  - `ENGINE_EVIDENCE_V1` — request-aware evidence contract, separate from
+    the SQLite schema version: exact (non-bound) score required, WDL
+    required and summing to exactly 1000, `depth`/`nodes` required,
+    non-empty PV that replays legally from the canonical root, forced-root
+    PV consistency, `mate=0` at a nonterminal root rejected; malformed
+    evidence is never silently repaired. A hard node budget can leave the
+    final engine line bounded, so `_analyse_exact()` streams the analysis
+    and retains the LAST unbounded scored report carrying the required
+    evidence/PV (not explicitly the maximum-depth report); when the search
+    ends during a later bounded aspiration re-search the retained report
+    may be an earlier, shallower one. `EngineEvaluation.nodes` is that
+    retained report's counter, NOT total node expenditure
+  - `EngineEvaluation` — exactly one of centipawn/mate (integer `mate=0`
+    represented faithfully); WDL non-negative, total exactly 1000; derived
+    `expected_score` documented as the engine-model expected score (not a
+    human / rating / time-control probability)
+  - POV normalization to the root side to move via `PovScore.pov()` /
+    `PovWdl.pov()`, with White- and Black-to-move tests
+  - `StockfishEvaluator` — not started at import/construction;
+    context-manager lifecycle; `UCI_ShowWDL` required at `start()`; a fresh
+    `game` sentinel per independent search so python-chess sends
+    `ucinewgame`; cache hits never call the engine
+  - `SemanticCacheKey` — L1 and L2 key on the same tuple
+    (position-semantics version, EPD, search mode, root-move sentinel,
+    executable SHA-256, engine name, eval-file sentinel, nodes, threads,
+    hash_mb, analysis-profile fingerprint, evidence-contract version);
+    `None`/`""` optional fields normalize identically in both layers; no
+    rating/time-control/cohort/source/opening/user dimension
+  - `SQLiteEvaluationCache` — schema version 2 in `PRAGMA user_version`,
+    checked on open (fresh init / supported reopen / incompatible version
+    rejected / unversioned-non-empty rejected); no migrations; every
+    primary-key column `NOT NULL` plus low-complexity `CHECK` constraints;
+    Python re-validates every row; immutable writes (plain `INSERT`;
+    same-value put is idempotent, different-value put raises
+    `CacheIntegrityError`); corrupt persistent content (bad JSON, wrong
+    shape, illegal PV, request/evidence mismatch) raises `CacheIntegrityError`
+  - `TieredEvaluationCache` (L2-then-L1 put, so L1 never diverges from L2
+    after a persistent conflict) and `CachedEvaluator` (validates the
+    request before any cache lookup; failed evaluations never cached)
+  - `resolve_executable()` — at `start()` the caller-supplied executable
+    reference is resolved once (absolute / relative-with-separator taken as
+    a filesystem path; a bare command name resolved through `PATH` via
+    `shutil.which`; unresolvable → `EngineStartupError`) and that one path
+    is used for both hashing and process launch; still excluded from cache
+    identity (executable SHA-256 remains the content identity); stdlib
+    only, no new dependency
+  - manual, non-pytest smoke helper (`scripts/stockfish_smoke.py`) takes a
+    caller-supplied executable path and exercises White/Black canonical
+    positions, UNRESTRICTED + FORCED_MOVE, L1/L2 cache hits, and a
+    SQLite close/reopen re-read
+  - EngineRegret, mistake/damage thresholds, MultiPV-based recommendations,
+    and any dependency on `personal.py` are explicitly out of scope
+- Real Stockfish smoke test: **passed** on 2026-09-10 against the local
+  binary `/home/dvir/tools/stockfish/stockfish/stockfish-linux-x86-64-universal`
+  (reports UCI name `Stockfish 19`, default network `nn-1a298aa575a0.nnue`).
+  Startup through python-chess, executable SHA-256 identity, White-to-move
+  and Black-to-move POV results, FORCED_MOVE using the first PV move, cache
+  hits, and SQLite close/reopen re-read all succeeded at a 300000-node
+  development budget. Re-run and passed again after the final polish pass
+  added one-time executable-path resolution.
+- The complete test suite has 272 passing tests, plus one known unrelated
+  python-chess `chess.engine` deprecation warning. Ordinary pytest never
+  depends on a real Stockfish binary.
+
+### Tested local environment (Step 4A verification)
+
+Step 4A was implemented and verified in this local environment (versions
+read from the project virtual environment, not assumed):
+
+- Python 3.14.4 (`.venv`)
+- `chess` (python-chess) 1.11.2
+- pytest 9.1.1 (local `.venv`)
+- Stockfish 19 — the manually validated external UCI engine
+  (`/home/dvir/tools/stockfish/stockfish/stockfish-linux-x86-64-universal`,
+  reports UCI name `Stockfish 19`, default network `nn-1a298aa575a0.nnue`);
+  not required by, or exercised in, the ordinary pytest suite.
+
+The independent external Astra audit ran in its own disposable environment
+and reported python-chess/chess 1.11.2 and pytest 9.1.1; these happen to
+match the local versions above. This is not dependency pinning or lockfile
+work — no version constraints were added in this pass.
 
 ## Core Product Direction
 
@@ -143,15 +265,29 @@ CORE/LEGACY/missing/unknown disposition, per-game transactional CORE
 accounting, and separate per-cohort `PositionIndex` instances for
 Rapid / Blitz / Bullet.
 
+Step 4A (engine foundation + evaluation cache) is implemented and
+architecturally approved (see the Engine evaluation section of
+`docs/architecture.md`): the `CANONICAL_POSITION_V1` canonical-position
+contract, `ENGINE_EVIDENCE_V1` request-aware evidence validation, streaming
+exact-line selection in `_analyse_exact()`, `SemanticCacheKey` shared by
+L1/L2, one-time executable-path resolution, SQLite schema version 2 with
+no migrations, and immutable-`INSERT` cache writes. It does not define
+EngineRegret.
+
 Not implemented:
 
 - Chess.com network/API ingestion
 - reference-corpus ingestion
 - rating bands inside CORE
 - legacy / combined PositionIndexes
+- EngineRegret / mistake-threshold analysis
+- opening classification
+- training/content loop, retention/progress mechanics
+- Lichess reference cohorts
+- weakness/priority ranking
 
-Remaining future work: Stockfish integration, regret calculation, Top-K
-weakness ranking, opening classification, visual/training UI.
+Remaining future work: EngineRegret and Top-K weakness ranking, reference-
+population (Lichess) ingestion, opening classification, visual/training UI.
 
 Preventing cross-source / cross-call duplicate ingestion of the same game is
 the responsibility of the future ingestion/corpus layer, not `PositionIndex`
@@ -164,10 +300,10 @@ source ordinal so that game identity stays reproducible.
 
 ## Next Step
 
-Step 3C is complete and approved. Step 4 has not started.
+Step 4A (engine foundation + evaluation cache) is complete and
+architecturally approved, recorded by this checkpoint commit.
 
-The next step is architectural planning only — to be designed with Dvir and
-the project reviewer before any implementation. No Step 4 architecture has
-been decided yet. Stockfish, reference-corpus ingestion, regret / Top-K
-ranking, opening classification, persistence, and UI all remain out of scope
-until explicitly planned and approved.
+Step 4B (EngineRegret and any use of engine evidence in ranking), reference-
+corpus (Lichess) ingestion, opening classification, and visual/training UI
+all remain out of scope until explicitly planned and approved. No Step 4B
+architecture has been decided yet.
