@@ -513,12 +513,293 @@ never turned into a silent cache miss or a repaired value.
 - Invalid custom-PGN initial-position validation is noted as possible
   future ingestion hardening; Step 4A does not reopen Step 3 architecture.
 
+## Engine damage assessment (Step 4B)
+
+Step 4B (`assessment.py`) turns Step 4A engine evidence into a bounded,
+auditable judgement about one canonical decision. It adds no second engine
+abstraction and no second cache: it composes the existing
+`EvaluationRequest` / `EngineEvaluation` value objects, `validate_request()`,
+and the existing L1/L2 evaluation cache.
+
+### The product rule: damaging-move detector, not best-move detector
+
+A move is never damaging merely because Stockfish prefers a different move.
+Several moves in one position may all be perfectly acceptable. The only
+supported positive conclusion is:
+
+> there exists a credible alternative A, A is materially better than the
+> observed move, that advantage survives the required higher-budget
+> confirmation, and no relevant contradiction remains.
+
+This is enforced structurally, not by convention:
+
+- `UNRESTRICTED` search is used **only to discover** a candidate. Its score
+  can never reach the arithmetic, because a signed gap exists only on
+  `ComparisonRound`, and a round refuses any evidence that is not a
+  `FORCED_MOVE` evaluation (`MoveEvidence` rejects a non-forced request).
+- Discovery selecting the observed move ends the assessment as
+  `NO_DAMAGE_DEMONSTRATED`, explicitly *not* as proof of optimality.
+- Precision is prioritized over recall throughout: candidate discovery is
+  top-1 only, so missing another strong move costs recall, never precision.
+
+### Expected-score arithmetic
+
+Comparisons are integer-only. For one evaluation,
+`U = 2*W + D` over the Stockfish WDL triple (`0 <= U <= 2000`); the display
+form is `U / 2000`. For an alternative A and the observed move,
+`SignedGapUnits = U(A) - U(observed)`. Signs are preserved exactly: never
+clamped, never absolute-valued, never floored at zero. A positive number is a
+measurement, not a verdict.
+
+Four things are kept deliberately distinct and are never collapsed into one
+float:
+
+1. the positive measured gap (`ComparisonRound.signed_gap_units`),
+2. a meaningful measured gap (compared against `tau_units`),
+3. a search-robust pairwise advantage (the same witness across two levels,
+   passing the drift/consistency gate),
+4. the `DAMAGE_SUPPORTED` decision.
+
+### `ComparisonPolicy`
+
+The comparison procedure is one immutable, validated object: policy identity
+and version, the B1 / B2 / optional B3 `SearchLevel`s (strictly increasing
+node budgets), `epsilon_units`, `tau_units`, three separate drift limits
+(gap, alternative component, observed-move component),
+`material_negative_gap_units`, `max_active_alternatives`, an optional
+`max_requests_per_decision` work bound, and a `CalibrationStatus` with its
+`calibration_id`.
+
+**No production thresholds exist anywhere in the module.** Every threshold is
+a required constructor argument, so no caller can inherit an invented
+epsilon, tau, drift limit, or budget, and there is no module-level default
+policy (a test asserts this). A policy whose status is `UNCALIBRATED` runs
+the full measurement — which is exactly what a calibration experiment needs —
+but can never emit `DAMAGE_SUPPORTED`: the positive label is withheld and the
+result is `INCONCLUSIVE` with reason `UNCALIBRATED_POLICY`.
+
+Policy identity is deliberately **outside** primitive engine cache identity.
+`SemanticCacheKey` gains no policy dimension, so changing `tau_units` or
+`epsilon_units` re-derives every decision from identical cached Stockfish
+evidence without a single new engine request.
+
+### Search levels and the evidence provider
+
+Step 4A binds one `EngineAnalysisConfig` — including `nodes` — per
+`StockfishEvaluator` for its lifetime, and that interface is unchanged. Step
+4B therefore introduces a two-method seam, `LeveledEvidenceProvider`:
+`request_for(level, position, mode, root_move)` builds the validated Step 4A
+request (so budget, engine identity and forced root move are recorded as
+provenance and can be checked for compatibility), and `evaluate(request)`
+returns the evidence answering exactly that request.
+
+`CachedEvaluatorPool` is the concrete implementation: one started evaluator
+per level, all sharing one Step 4A cache and required to report the same
+`EngineIdentity`. Two levels may not share an identical analysis config,
+which would make them indistinguishable to the cache.
+
+### The bounded procedure
+
+**B1 — initial screen.** Building the Step 4A request validates the root and
+the observed move (terminal root, non-canonical key, or illegal move raise
+`RequestValidationError` before any engine work). A single legal move ends as
+`NO_DAMAGE_DEMONSTRATED` / `ONLY_LEGAL_MOVE` with zero engine calls. An
+observed move that delivers immediate checkmate ends the same way
+(`U = 2000` is the exact rule-derived maximum, so nothing can beat it), also
+with zero engine calls. Otherwise B1 discovers a candidate, force-evaluates
+the candidate and the observed move at the same budget, and computes the
+signed gap. Because `S(A) = min(G_prev, G_cur) <= G_1`, a B1 gap that cannot
+reach tau (`G_1 - epsilon <= tau`) stops the procedure cheaply as
+`NO_DAMAGE_DEMONSTRATED` — a screened, non-actionable difference, not a claim
+of optimality or equivalence.
+
+**B2 — mandatory confirmation.** A B1 positive can never become
+`DAMAGE_SUPPORTED` directly; every potentially actionable positive is
+re-measured at the higher budget. B2 rediscovers top-1, keeps at most two
+active distinct alternatives, force-evaluates the observed move and every
+active alternative at B2, and **backfills** any newly discovered candidate's
+B1 forced evaluation before it may act as a two-level witness.
+
+**Fixed witness.** Qualification is per candidate, never over a moving
+maximum. `_compare_levels` refuses two rounds whose alternatives differ, and
+refuses the same level twice, so "A1 led at B1, A2 leads at B2, therefore
+*an* alternative was consistently better" cannot be assembled. For one
+candidate A across two prescribed levels:
+`S(A) = min(G_prev(A), G_cur(A))` and `L(A) = S(A) - epsilon_units`; damage
+requires `L(A) > tau_units` **and** a clean consistency gate. `L` is a
+conservative empirical margin, not a mathematical lower confidence bound on
+true chess value. The final measured gap, the conservative margin `L`, and
+the accepted regret `S` are stored as three separate values.
+
+**Drift / consistency.** Sign agreement alone is not checked; a stable gap
+can hide large movement in both components. The gate checks the change in the
+pairwise gap, in the alternative's evaluation, and in the observed move's
+evaluation, each against its own policy limit, plus a mate-direction
+reversal. A mate *appearing* at a higher budget is normal and is not a
+contradiction; a mate *direction reversal* (for the root side ↔ against it)
+is. Instability only counts as unresolved when some level actually alleges
+material damage — an unstable measurement that never approaches tau still
+ends conservatively as `NO_DAMAGE_DEMONSTRATED`.
+
+**B3 — one bounded final escalation.** Triggers are: sign reversal, gap
+drift, either component drift, mate-direction reversal, a material negative
+benchmark discrepancy (the level's own discovered top-1 scoring materially
+worse than the observed move under equal forced budgets), and higher-budget
+discovery selecting the observed move while forced evidence alleges material
+damage. At B3 previous evidence is preserved, the bounded alternative set is
+maintained (the weakest known candidate is evicted, so a newly discovered
+move never displaces an already stable stronger witness), required backfills
+are performed, and qualification uses the **last two prescribed levels**
+(B2, B3) — never the two most favourable earlier ones. After B3 the procedure
+stops unconditionally; engine work is never increased until a positive result
+appears. Unresolved evidence ends as `INCONCLUSIVE`.
+
+An optional `max_requests_per_decision` bounds total distinct engine requests
+per decision; hitting it yields `INCONCLUSIVE` / `WORK_BUDGET_EXHAUSTED`
+rather than a guess. Repeating an identical request inside one assessment is
+memoized and, below that, served by the Step 4A cache: such reuse is evidence
+reuse, never an additional independent confirmation. A B1 and a B2 evaluation
+of the same move are different requests with different semantic cache keys,
+so a cache hit at one level can never satisfy the other.
+
+### Final states
+
+`DAMAGE_SUPPORTED`, `NO_DAMAGE_DEMONSTRATED`, `INCONCLUSIVE`,
+`INVALID_EVIDENCE`. `RECHECK_REQUIRED` and `VALID_COMPARISON` deliberately do
+not exist: neither is a final verdict about move quality. The exact,
+quotable wording of each state lives in `STATUS_SEMANTICS` so downstream
+reporting does not paraphrase and overclaim. In particular
+`NO_DAMAGE_DEMONSTRATED` never asserts optimality and never asserts that the
+compared moves are proven equivalent.
+
+Step 4A's fail-loud style is preserved for malformed *questions*: an invalid
+root or observed move raises `RequestValidationError`. Malformed or
+incompatible *evidence* raises `AssessmentEvidenceError` at the value-object
+boundary (so a bad `MoveEvidence` or `ComparisonRound` can never exist) and
+the orchestrator reports it as `INVALID_EVIDENCE` — never as a harmless zero
+gap.
+
+### `EngineRegret`
+
+An `EngineRegret` exists **only** for `DAMAGE_SUPPORTED`, enforced in
+`MoveAssessment.__post_init__` (regret, witness, and conservative margin are
+present if and only if the status is `DAMAGE_SUPPORTED`). It is never
+`max(0, gap)` and never derived from a negative gap. Its `units` value is the
+conservative accepted loss `S(A)`, which is strictly positive whenever the
+contract passed, and it carries the policy id/version/fingerprint and the two
+qualification levels as provenance.
+
+Negative gaps are preserved as measurements. A small negative near-tie stops
+as `NO_DAMAGE_DEMONSTRATED` — it does not mean the observed move is globally
+best, that the evidence is corrupt, or that regret should become zero. A
+material negative discrepancy escalates, and a persistent unresolved one ends
+as `INCONCLUSIVE`.
+
+### WDL / CP / mate / PV roles
+
+WDL expected score is the single damage metric. CP is a supporting,
+explanatory diagnostic (`ComparisonRound.centipawn_gap`) and never enters a
+threshold test. Mate is categorical evidence with its distance preserved
+(`_mate_direction`); it is never converted into a large centipawn number.
+There is no compound "WDL regret + CP bonus + mate penalty" formula: WDL and
+CP are not independent confirmation signals. Depth and nodes remain
+provenance.
+
+### Terminal semantics
+
+`immediate_terminal_after()` applies the root move locally and reports the
+exact rule-derived state (checkmate / stalemate / insufficient material). It
+is used for the observed-immediate-checkmate shortcut and as an integrity
+check: evidence for a mating move must report `mate == 1`, and evidence for
+an exact draw must report no mate; a contradiction is
+`TERMINAL_EVIDENCE_CONTRADICTION` / `INVALID_EVIDENCE`. Rule-derived facts
+never replace or fabricate engine evidence, and engine provenance is always
+preserved. Mate-distance differences alone create no regret: two winning
+moves with different mate distances both measure 2000 units (gap 0), and two
+losing moves at different distances receive no "losing sooner" penalty.
+
+### Historical semantic limit
+
+Step 4B produces **canonical-position engine-damage evidence**, quotable via
+`CANONICAL_DAMAGE_SCOPE_NOTE`. Because `PositionKey` deliberately excludes
+the halfmove clock and prior repetition history, an assessment does not claim
+that every historical occurrence of the decision lost exactly the same
+amount. `MoveAssessment` carries no game, occurrence, ply, rating, or
+time-control dimension, and Step 4B does not touch occurrence storage. A
+later occurrence-level eligibility check can handle draw-history-sensitive
+claims.
+
+### Escalation provenance
+
+`MoveAssessment` records two disjoint trigger sets. `unresolved_triggers`
+holds only the contradictions still unresolved at the final decision.
+`resolved_triggers` holds escalation triggers an earlier prescribed pair
+raised that the later prescribed pair no longer raises — computed as
+`B1/B2 triggers - B2/B3 triggers`, so a B1/B2 instability that B3 settled
+stays visible on the immutable result instead of silently disappearing. The
+two halves can both be non-empty when B3 resolves part of the history and
+introduces or retains the rest. `resolved_triggers` is provenance and
+calibration information, never a confidence score, and it deliberately does
+not block admission once the prescribed later pair genuinely passes.
+
+### Step 4C admission contract
+
+`MoveAssessment.is_engine_damage_admissible` (with `admission_failures`
+listing every reason it is not) is the one gate Step 4C must consult. It
+re-derives the qualification from the recorded trace rather than trusting
+`status` or `unresolved_triggers`: the two stored qualification rounds are
+fed back through **the same `_compare_levels` gate the orchestrator used**,
+so a hand-built or malformed assessment whose rounds actually violate a
+fixed-witness, sign, drift, mate-direction, or materiality check can never be
+admitted, however its summary fields were filled in. It requires:
+
+- final status `DAMAGE_SUPPORTED`, no unresolved triggers, and a policy whose
+  calibration scope permits the conclusion;
+- a witness distinct from the observed move, with candidate-discovery
+  provenance;
+- **accepted-regret provenance** — the regret must name the confirmed
+  witness and carry this policy's `policy_id`, `policy_version`,
+  `fingerprint`, and the assessment's own qualification levels;
+- **the prescribed qualification pair**, not an arbitrary two-level tuple.
+  Whether B3 was entered is read off the trace (a B3 discovery *or* a B3
+  round); if it was, the pair must be `(B2, B3)`, otherwise `(B1, B2)`. A
+  skipped pair such as `(B1, B3)`, and a B3-bearing trace claiming to qualify
+  on favourable earlier B1/B2 evidence, are both rejected;
+- per-round integrity — each round rooted at the observed position,
+  evaluating the observed move, `FORCED_MOVE` on both sides, equal requested
+  budgets, compatible engine identity;
+- **cross-level compatibility** — the two rounds must agree on every
+  dimension of the Step 4A `SemanticCacheKey` except the requested node
+  budget (`_CROSS_LEVEL_INVARIANT_FIELDS` is derived from that key, so a
+  future key dimension is covered automatically and no new cache-key scheme
+  is introduced);
+- the re-derived verdict must carry no triggers and must exceed tau, with
+  `regret.units == min(G_prev, G_cur)`, `conservative_margin_units == S -
+  epsilon`, and `final_gap_units` equal to the signed gap of the later
+  qualification round.
+
+Recurrence can never promote `NO_DAMAGE_DEMONSTRATED` or `INCONCLUSIVE` into
+damage: fifty occurrences of one uncertain engine decision remain one
+uncertain engine decision.
+
+### Not calibrated
+
+Step 4B implements the architecture calibration needs; it does not pretend
+calibration has happened. No production epsilon, tau, drift limit, or
+B1/B2/B3 budget has been chosen, and no false-positive rate, accepted-label
+reliability, abstention rate, or computational cost has been measured. The
+budgets and thresholds in `tests/test_assessment_stockfish.py` and
+`scripts/stockfish_assessment_smoke.py` are demonstration fixtures labelled
+as such, never production configuration.
+
 ## Out of scope for now
 
 The following are known future directions but are explicitly not part of
 the current foundation and have no design yet:
 
-- EngineRegret / mistake-threshold analysis
+- Calibrated production thresholds for Step 4B (epsilon, tau, drift
+  limits, B1/B2/B3 budgets) and any measured reliability claim
+- Step 4C: recurring-weakness ranking / Top-K over accepted engine damage
 - Reference-corpus (Lichess) ingestion
 - Opening classification
 - Parallel processing

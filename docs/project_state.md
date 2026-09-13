@@ -2,6 +2,11 @@
 
 ## Current Phase
 
+Step 4B is IMPLEMENTED and AWAITING REVIEW — the canonical-position
+damaging-move measurement and orchestration foundation (`assessment.py`).
+It is **not** approved, **not** calibrated, and **not** cleared for
+production damaging-move claims. No commit has been made for it.
+
 Step 4A is COMPLETE and architecturally APPROVED — Stockfish engine
 foundation and a persistent two-level evaluation cache (`engine.py`,
 `engine_cache.py`). Two independent architecture audits reviewed it: the
@@ -194,6 +199,98 @@ independent architecture audits (this checkpoint commit; supersedes
     SQLite close/reopen re-read
   - EngineRegret, mistake/damage thresholds, MultiPV-based recommendations,
     and any dependency on `personal.py` are explicitly out of scope
+- Step 4B (IMPLEMENTED, AWAITING REVIEW, UNCALIBRATED): canonical-position
+  damaging-move measurement and orchestration (`assessment.py`). See the
+  "Engine damage assessment (Step 4B)" section of `docs/architecture.md`.
+  `engine.py` and `engine_cache.py` are unchanged.
+  - `ASSESSMENT_SEMANTICS_VERSION = "CANONICAL_DECISION_DAMAGE_V1"` and
+    `CANONICAL_DAMAGE_SCOPE_NOTE` — the quotable statement of exactly what a
+    result does and does not claim
+  - integer expected-score units `U = 2*W + D` (`0..2000`);
+    `SignedGapUnits = U(alternative) - U(observed)` preserved exactly, never
+    clamped, absolute-valued, or floored at zero
+  - `ComparisonPolicy` — immutable, validated, keyword-only: policy
+    id/version, B1/B2/optional-B3 `SearchLevel`s with strictly increasing
+    node budgets, `epsilon_units`, `tau_units`, three separate drift limits,
+    `material_negative_gap_units`, bounded `max_active_alternatives`,
+    optional `max_requests_per_decision`, `CalibrationStatus` +
+    `calibration_id`, and a deterministic SHA-256 `fingerprint`. **No
+    production threshold values exist in the module and there is no default
+    policy**; an `UNCALIBRATED` policy runs the full measurement but can
+    never emit `DAMAGE_SUPPORTED`
+  - policy identity is outside primitive engine cache identity: changing tau
+    or epsilon reuses identical cached Stockfish evidence (tested)
+  - `MoveEvidence` / `CandidateDiscovery` / `ComparisonRound` — the signed
+    gap exists only on a round, and a round accepts only `FORCED_MOVE`
+    evidence, so an `UNRESTRICTED` discovery score structurally cannot enter
+    regret arithmetic
+  - candidate discovery v1: top-1 unrestricted only, rediscovery when the
+    procedure advances, at most two active distinct alternatives, weakest
+    evicted first. No MultiPV
+  - B1 screen (only-legal-move and observed-immediate-checkmate short
+    circuits cost zero engine calls) → mandatory B2 confirmation → one
+    optional bounded B3 → hard stop
+  - fixed-witness qualification: `S(A) = min(G_prev, G_cur)`,
+    `L(A) = S(A) - epsilon`, damage requires `L(A) > tau` plus a clean
+    consistency gate; `_compare_levels` refuses a candidate switch and
+    refuses the same level twice, so a moving maximum cannot masquerade as
+    confirmation; a candidate discovered at a higher level is backfilled at
+    the lower level before it may witness
+  - drift/consistency gate over the pairwise gap, the alternative component,
+    and the observed-move component separately, plus mate-direction
+    reversal; escalation triggers also include a material negative benchmark
+    discrepancy and higher-budget discovery selecting the observed move
+  - `AssessmentStatus` = `DAMAGE_SUPPORTED` / `NO_DAMAGE_DEMONSTRATED` /
+    `INCONCLUSIVE` / `INVALID_EVIDENCE`, with quotable `STATUS_SEMANTICS`
+    wording; no `RECHECK_REQUIRED`, no `VALID_COMPARISON`. Step 4A's typed
+    exceptions are preserved for malformed questions
+    (`RequestValidationError`); malformed evidence raises
+    `AssessmentEvidenceError` at the value-object boundary and surfaces as
+    `INVALID_EVIDENCE`, never as a harmless zero
+  - `EngineRegret` exists if and only if the status is `DAMAGE_SUPPORTED`
+    (enforced in `MoveAssessment.__post_init__`); it is never `max(0, gap)`
+    and never derived from a negative gap. Final measured gap, conservative
+    margin `L`, and accepted loss `S` are three separate recorded values
+  - exact terminal semantics via `immediate_terminal_after()`, used as a
+    shortcut and as an integrity check against the engine's categorical mate
+    evidence; rule-derived facts never replace engine evidence
+  - `MoveAssessment.is_engine_damage_admissible` / `admission_failures` —
+    the Step 4C admission contract. It re-derives the qualification by
+    feeding the two stored rounds back through the same `_compare_levels`
+    gate the orchestrator used, so it trusts neither `status` nor
+    `unresolved_triggers`; it independently checks accepted-regret policy
+    provenance (id / version / fingerprint / levels), that `final_gap_units`
+    matches the later qualifying round, that the qualification pair is the
+    prescribed one for whether B3 was actually entered (read off the trace),
+    and that the two rounds agree on every Step 4A `SemanticCacheKey`
+    dimension except the node budget. Recurrence can never promote
+    `NO_DAMAGE_DEMONSTRATED` or `INCONCLUSIVE` into damage
+  - `MoveAssessment.resolved_triggers` — escalation provenance: triggers an
+    earlier prescribed pair raised that the later prescribed pair resolved,
+    kept disjoint from `unresolved_triggers` so a B1/B2 instability settled
+    by B3 stays visible without blocking admission
+  - `LeveledEvidenceProvider` protocol + `CachedEvaluatorPool`: one started
+    Step 4A evaluator per level over one shared Step 4A cache (Step 4A binds
+    the node budget per evaluator for its lifetime, and that interface was
+    deliberately left unchanged). Same engine identity required across
+    levels; no second engine abstraction and no second cache
+  - 106 synthetic unit tests (`tests/test_assessment.py`), including a
+    block of adversarial attacks on the admission contract using
+    hand-built DAMAGE_SUPPORTED assessments; 10 opt-in
+    real-engine tests (`tests/test_assessment_stockfish.py`, skipped unless
+    `CDE_STOCKFISH_PATH` is set), and a manual smoke helper
+    (`scripts/stockfish_assessment_smoke.py`)
+- Real Stockfish Step 4B checks: **passed** on 2026-09-13 against
+  `/home/dvir/tools/stockfish/stockfish/stockfish-linux-x86-64-universal`
+  (UCI name `Stockfish 19`, network `nn-1a298aa575a0.nnue`). The 10 opt-in
+  integration tests ran in ~3.6 s at 20000/60000-node test budgets; the
+  manual smoke script ran at 40000/120000/360000-node demonstration budgets
+  and covered a White tactical blunder, a Black tactical blunder, a quiet
+  near-equivalent opening choice (correctly NOT damaging, measured gap 5
+  units), an observed immediate checkmate (0 engine requests), an immediate
+  stalemate transition, forced-root consistency, and a repeated decision
+  consuming no further engine analyses. These budgets and thresholds are
+  demonstration fixtures, NOT calibrated production values.
 - Real Stockfish smoke test: **passed** on 2026-09-10 against the local
   binary `/home/dvir/tools/stockfish/stockfish/stockfish-linux-x86-64-universal`
   (reports UCI name `Stockfish 19`, default network `nn-1a298aa575a0.nnue`).
@@ -202,9 +299,11 @@ independent architecture audits (this checkpoint commit; supersedes
   hits, and SQLite close/reopen re-read all succeeded at a 300000-node
   development budget. Re-run and passed again after the final polish pass
   added one-time executable-path resolution.
-- The complete test suite has 272 passing tests, plus one known unrelated
-  python-chess `chess.engine` deprecation warning. Ordinary pytest never
-  depends on a real Stockfish binary.
+- The complete test suite has 378 passing tests plus 10 skipped opt-in
+  real-engine tests, plus one known unrelated python-chess
+  `chess.engine` deprecation warning. Ordinary pytest never depends on a
+  real Stockfish binary: the Step 4B integration module is skipped unless
+  `CDE_STOCKFISH_PATH` is set.
 
 ### Tested local environment (Step 4A verification)
 
@@ -274,20 +373,33 @@ L1/L2, one-time executable-path resolution, SQLite schema version 2 with
 no migrations, and immutable-`INSERT` cache writes. It does not define
 EngineRegret.
 
+Step 4B (damaging-move measurement and orchestration) is implemented but
+NOT yet approved and NOT yet calibrated (see the Engine damage assessment
+section of `docs/architecture.md`). Its architecture — integer
+expected-score units, forced-move-only comparison arithmetic, fixed-witness
+two-level confirmation, drift/consistency gating, bounded B3 escalation,
+`EngineRegret` only for `DAMAGE_SUPPORTED`, and the Step 4C admission
+contract — is complete, but **no production epsilon, tau, drift limit, or
+B1/B2/B3 node budget has been chosen, and no reliability, false-positive
+rate, abstention rate, or computational cost has been measured.**
+Automatic damaging-move claims are therefore NOT production-approved.
+
 Not implemented:
 
 - Chess.com network/API ingestion
 - reference-corpus ingestion
 - rating bands inside CORE
 - legacy / combined PositionIndexes
-- EngineRegret / mistake-threshold analysis
+- calibrated Step 4B thresholds / any measured reliability claim
+- Step 4C recurring-weakness ranking over accepted engine damage
 - opening classification
 - training/content loop, retention/progress mechanics
 - Lichess reference cohorts
 - weakness/priority ranking
 
-Remaining future work: EngineRegret and Top-K weakness ranking, reference-
-population (Lichess) ingestion, opening classification, visual/training UI.
+Remaining future work: Step 4B calibration, Step 4C Top-K weakness
+ranking, reference-population (Lichess) ingestion, opening classification,
+visual/training UI.
 
 Preventing cross-source / cross-call duplicate ingestion of the same game is
 the responsibility of the future ingestion/corpus layer, not `PositionIndex`
@@ -300,10 +412,26 @@ source ordinal so that game identity stays reproducible.
 
 ## Next Step
 
-Step 4A (engine foundation + evaluation cache) is complete and
-architecturally approved, recorded by this checkpoint commit.
+Step 4B is implemented and awaiting review. Nothing has been committed.
 
-Step 4B (EngineRegret and any use of engine evidence in ranking), reference-
-corpus (Lichess) ingestion, opening classification, and visual/training UI
-all remain out of scope until explicitly planned and approved. No Step 4B
+Required before Step 4B can be considered done:
+
+1. **Architecture/correctness review** of `assessment.py`, its tests, and the
+   two documentation sections above.
+2. **A real-data calibration phase**, run separately after review. Until it
+   has run, the automatic damaging-move label is not production-approved and
+   no reliability claim may be made. Calibration must determine:
+   - the B1 / B2 / B3 node budgets
+   - `epsilon_units` (the search-error allowance)
+   - `tau_units` (the materiality threshold)
+   - the three drift limits and `material_negative_gap_units`
+   - the accepted-label reliability / false-positive rate
+   - the abstention (`INCONCLUSIVE`) rate
+   - the computational cost per decision and per dataset
+3. Only then may a `CALIBRATED` `ComparisonPolicy` with real values be
+   defined, and only then may Step 4C consume accepted engine damage.
+
+Step 4C (recurring-weakness ranking over accepted engine damage), reference-
+corpus (Lichess) ingestion, opening classification, and the visual/training
+UI all remain out of scope until explicitly planned and approved. No Step 4C
 architecture has been decided yet.
