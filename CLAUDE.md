@@ -6,17 +6,15 @@ Permanent instructions for Claude Code working on this repository.
 
 - Project name: Chess Decision Explorer.
 - Python project developed on Ubuntu/Linux.
-- Main goal: analyze a user's chess history, identify recurring damaging
-  decisions, compare them with a reference population, and later add
-  Stockfish and visual/opening-training features.
+- Main goal: analyze a player's chess history, identify recurring decisions, evaluate damaging choices with Stockfish evidence, and later combine those results with rating-matched human reference data and training workflows.
+- The current repository already includes the domain model, aggregation, streaming local PGN ingestion, personal Rapid/Blitz/Bullet cohorts, Stockfish/UCI evaluation, a two-level in-memory/SQLite cache, and the Step 4B move-damage assessment foundation.
+- Step 4B is still uncalibrated. Step 4C recurrence-based ranking is not implemented.
 
 ## Authority and architecture
 
-- Architecture and analysis semantics are decided by Dvir together with the
-  project reviewer.
+- Architecture and analysis semantics are decided by Dvir together with the project reviewer.
 - Claude must not invent, expand, or silently change architecture.
-- Before significant work, read `docs/architecture.md` and
-  `docs/project_state.md`.
+- Before significant work, read `docs/architecture.md` and `docs/project_state.md`.
 - Existing tests and approved architecture are constraints, not suggestions.
 
 ## Scope discipline
@@ -27,18 +25,18 @@ Permanent instructions for Claude Code working on this repository.
 - Do not implement future features unless explicitly requested.
 - Prefer minimal, clear implementations over speculative abstractions.
 
-### Current known future features that must NOT be implemented unless requested
+### Current future work that must NOT be implemented unless requested
 
-- Chess.com ingestion
-- Lichess/reference ingestion
-- statistics aggregation
-- regret / Top-K analysis
-- Stockfish
-- concurrency / multiprocessing
-- persistent databases
-- opening classification
-- repertoire scoring/training
-- web/visual UI
+- calibration of Step 4B production thresholds and search budgets
+- Step 4C recurrence × admitted-engine-damage ranking
+- Chess.com API ingestion beyond the implemented local-PGN path
+- Lichess/reference-corpus ingestion and rating-matched human evidence
+- opening classification and repertoire analysis
+- targeted training and longitudinal progress tracking
+- concurrency / multiprocessing architecture
+- cloud infrastructure or alternate production databases
+- web / visual UI
+- cross-position pattern intelligence / ML similarity methods
 
 ## Git workflow
 
@@ -46,6 +44,7 @@ Permanent instructions for Claude Code working on this repository.
 - Never commit unless explicitly authorized.
 - Never rewrite Git history without explicit authorization.
 - Do not modify unrelated files.
+- Do not include private session URLs, local machine paths, credentials, tokens, or personal datasets in commit messages or tracked files.
 
 ## Testing and review
 
