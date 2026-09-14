@@ -1,195 +1,65 @@
 # Chess Decision Explorer
 
-**Personalized chess improvement from the decisions a player actually repeats.**
+A Python analysis core for a personalized chess-improvement system: find decisions a player repeats, assess the engine evidence, and eventually turn recurring weaknesses into targeted practice.
 
-Most chess analysis reviews games one at a time. Chess Decision Explorer asks a longer-term question:
+The unit of analysis is a **decision: the position before a move, paired with the move played**. This connects the same choice across games, including positions reached through different move orders.
 
-> Which decisions keep returning in a player's games, which choices are meaningfully damaging, and what should the player study first?
+**Implemented:** streaming local PGN ingestion, recurring-position statistics, separate Rapid / Blitz / Bullet cohorts, Stockfish evaluation through UCI, an in-memory / SQLite evaluation cache, and a multi-stage move-assessment procedure.
 
-The long-term product is designed to combine three evidence sources:
+**Current boundary:** move assessment still needs calibration and review. Recurrence-based weakness ranking, rating-matched human comparisons, and training are future work. The repository currently exposes Python APIs and engine smoke scripts.
 
-- **Personal history** — what positions the player reaches and which moves they repeatedly choose.
-- **Engine evidence** — whether a move is materially worse than credible alternatives under controlled Stockfish analysis.
-- **Rating-matched human evidence** — how comparable players choose and continue from the same or related positions.
-
-Those signals are intended to become targeted training and, later, a way to measure whether a recurring weakness improves in future games.
-
-The current repository implements the personal-history pipeline and the Stockfish-based damage-assessment foundation. Human-reference analysis and the training product are roadmap items, not completed features.
-
-## What works today
-
-The current GitHub checkpoint includes:
-
-- streaming PGN ingestion into source-neutral game records;
-- canonical chess-position and move identities for recurring-decision analysis;
-- dictionary-backed aggregation of recurrence, distinct-game counts, choices, and outcomes;
-- separate Rapid, Blitz, and Bullet personal cohorts;
-- Stockfish 19 integration through UCI with node-budgeted unrestricted and forced-move searches;
-- robust move-damage assessment that confirms a fixed alternative across increasing search budgets instead of treating every deviation from Stockfish's first line as a mistake;
-- a two-level evaluation cache: in-memory L1 plus persistent SQLite L2;
-- semantic cache identity tied to the position, search contract, engine binary identity, and analysis configuration;
-- extensive unit, regression, adversarial, and opt-in real-Stockfish integration tests.
-
-The pipeline has also been exercised on **thousands of real Chess.com games**. Personal PGNs are intentionally excluded from the repository.
-
-## System at a glance
+## Data flow
 
 ```mermaid
-flowchart LR
-    A[Chess.com PGN history] --> B[Streaming ingestion]
-    B --> C[Canonical decisions]
-    C --> D[Personal recurrence and cohorts]
-    C --> E[Stockfish evidence]
-    E --> F[Robust damage assessment]
-    D --> G[Personalized study priority]
-    F --> G
-    H[Rating-matched human reference\nplanned] -.-> G
-    G --> I[Targeted training\nplanned]
-    I -. future games .-> D
+flowchart TD
+    PGN[Local PGN files] --> Personal[Parse games and extract player decisions]
+    Personal --> Index[Separate cohort indexes]
+    Index -->|Caller selects a decision| Assessment[Move assessment]
+    Assessment --> Cache[L1 memory and SQLite L2]
+    Cache -->|Cache miss| Engine[Stockfish via UCI]
+    Index -. Planned .-> Ranking[Recurring-weakness ranking]
+    Assessment -. Planned .-> Ranking
 ```
 
-The important separation is deliberate: personal recurrence, engine evidence, and future human-reference evidence are different kinds of information. They are not collapsed into one arbitrary weighted score.
+Personal statistics describe what happened. Engine assessments evaluate a canonical decision. The future ranking layer will combine recurrence with accepted damage evidence; rating-matched human data will remain a separate source of evidence.
 
-## Core analytical model
+## Design decisions
 
-The project starts from a small immutable domain model:
+### Recognize positions without tying them to a game
 
-```text
-PositionKey  = canonical position before the move
-MoveKey      = move played, stored in UCI
-DecisionKey  = (PositionKey, MoveKey)
-```
+`DecisionKey = (PositionKey, MoveKey)` uses immutable value objects. `MoveKey` stores UCI notation, such as `e2e4`. `PositionKey` includes piece placement, side to move, castling rights, and only legally relevant en-passant state.
 
-`PositionKey` uses the chess state needed for recurring-position identity:
+Move counters and prior repetition history are excluded. Engine analysis reconstructs this canonical position with reset counters and no pre-root history. That supports reuse across games, but an assessment does not reconstruct the exact draw-rule context of every historical occurrence.
 
-- piece placement;
-- side to move;
-- castling rights;
-- legally relevant en-passant state.
+### Count recurrence without counting a game's result twice
 
-Move counters and prior repetition history are intentionally excluded from recurring-position identity. Exact historical draw context is a separate problem and is not silently mixed into canonical analysis.
+PGNs are read one game at a time. A dictionary maps each `PositionKey` to position statistics, with move statistics keyed by `MoveKey` inside it.
 
-This representation lets the same decision be recognized across different PGN files without tying the analytical identity to player names, dates, move numbers, ratings, or source metadata.
+If a player reaches the same position three times in one game, that contributes three occurrences but one distinct game and one game outcome. Choice frequency uses occurrences; outcome statistics use distinct games. Eligible personal games are indexed separately by Rapid, Blitz, and Bullet.
 
-## Engineering highlights
+The index validates a game's observations before updating statistics and discards temporary per-game bookkeeping afterward. It retains no permanent game-ID sets. Memory still grows with unique indexed positions and decisions; the L1 evaluation cache also has no eviction policy. Preventing duplicate game submissions across ingestion calls remains the caller's responsibility.
 
-### Streaming ingestion and memory-conscious aggregation
+### Compare moves under controlled engine searches
 
-PGNs are parsed one game at a time. Player decisions are normalized before aggregation, and the central `PositionIndex` keeps compact statistics rather than permanent sets of every contributing game ID.
+An unrestricted search discovers an alternative. The observed move and that alternative are then evaluated in separate forced-root searches at equal requested node budgets. Only those forced evaluations enter the comparison.
 
-This keeps ingestion and aggregation independent of the eventual UI or data source and provides a bounded-memory foundation for larger corpora.
+For a positive assessment, the **same alternative** must remain meaningfully better across two prescribed search levels. The procedure checks changes in the gap and both component evaluations, sign reversals, and mate-direction conflicts. It allows one optional higher-budget escalation, then stops; unresolved evidence can produce `INCONCLUSIVE`.
 
-### Hash-based position indexing
+Engine output is validated before use: scores must be unbounded UCI reports, WDL must be complete, and the principal variation must replay legally and match the requested root move. Centipawn and mate evidence are retained alongside WDL. Comparisons use engine-model expected score from the root player's perspective, which is distinct from a human win probability.
 
-Canonical `PositionKey` and `DecisionKey` value objects are used as dictionary keys for recurrence and move statistics. The aggregation layer distinguishes:
+**Calibration is pending.** No production thresholds, search budgets, or measured error rates are established. A policy marked `UNCALIBRATED` cannot emit `DAMAGE_SUPPORTED`; the real-engine examples use explicitly labeled demonstration policies. `NO_DAMAGE_DEMONSTRATED` means the procedure found no qualifying evidence, without proving the move optimal.
 
-- total occurrences;
-- distinct games containing a position or decision;
-- player choices;
-- actor-relative outcomes.
+### Cache engine evidence independently of assessment policy
 
-This separation matters because a position can legitimately recur more than once inside the same game.
+Requests check an in-memory L1 cache, then persistent SQLite L2, and run Stockfish only on a miss. Both tiers use the same semantic key: canonical position, search mode and forced move, requested budget, engine executable SHA-256, engine configuration, and versioned analysis and evidence contracts.
 
-### Stockfish as an external evidence source
+SQLite rows are revalidated against their requests. Unsupported schemas, corrupt evidence, and conflicting writes raise errors; existing evidence is never silently overwritten. Persistence succeeds before L1 is updated.
 
-Stockfish is run through the UCI protocol using `python-chess`. Engine analysis is normalized to the side to move at the canonical root and supports both:
+Assessment thresholds are outside the primitive evaluation key. Changing a comparison threshold can reuse identical Stockfish evidence while deriving a new assessment. The supported engine configuration uses the default network; caller-selected external NNUE files are outside the current cache contract.
 
-- unrestricted candidate discovery;
-- forced-root evaluation of a specific move.
+## Run locally
 
-The project keeps raw centipawn/mate evidence alongside Stockfish WDL and derives an **engine-model expected score** for comparisons. It is not presented as a human win probability.
-
-### Damage assessment, not “top move” matching
-
-The current assessment layer is intentionally conservative. A player's move is not considered damaging simply because Stockfish prefers another move.
-
-A credible alternative must remain materially better under prescribed higher-budget confirmation, with consistency checks for search drift, sign reversals, mate-direction conflicts, and incompatible evidence.
-
-The result is a bounded evidence procedure designed to reduce false weakness labels caused by finite-search noise.
-
-### Two-level semantic cache
-
-Engine analysis is expensive and highly reusable, so evaluations are cached in two tiers:
-
-```text
-request
-  -> in-memory cache (L1)
-  -> SQLite cache (L2)
-  -> Stockfish only on a miss
-```
-
-Persistent cache identity includes the canonical position, search mode, requested budget, analysis profile, evidence-contract version, and SHA-256 identity of the Stockfish executable.
-
-The cache is treated as disposable computed evidence rather than product/user state. Corrupt or semantically incompatible cached evidence fails loudly instead of being silently reused.
-
-## Real-data validation
-
-The personal-data pipeline has been exercised on a local Chess.com history containing **5,128 completed games** across 60 monthly PGN files.
-
-That dataset is useful as real input and edge-case coverage; it is not presented as a large public corpus. Raw personal data is excluded from Git by design.
-
-The larger human-reference layer is planned separately so personal evidence and population evidence remain logically independent.
-
-## Current status
-
-| Phase | Status |
-| --- | --- |
-| Domain model and recurring-position identity | Complete |
-| Position / decision aggregation | Complete |
-| Streaming PGN ingestion | Complete |
-| Personal Rapid / Blitz / Bullet cohorts | Complete |
-| Stockfish UCI evaluation foundation | Complete |
-| In-memory + SQLite semantic evaluation cache | Complete |
-| Robust engine damage assessment | Complete on current `main` |
-| Personalized recurrence × damage prioritization | Active Step 4C |
-| Rating-matched human reference corpus | Planned |
-| Opening / repertoire context | Planned |
-| Training workflow and later-game progress tracking | Planned |
-
-The detailed architecture contracts and current engineering state live in [`docs/architecture.md`](docs/architecture.md) and [`docs/project_state.md`](docs/project_state.md).
-
-## Roadmap
-
-The next product layers are intentionally incremental:
-
-1. **Personalized priority** — combine admitted engine-damage evidence with the player's own recurrence so the system can answer “what should I study first?”
-2. **Occurrence traceability and deduplication** — preserve source-game references without bloating the aggregate index.
-3. **Opening and repertoire context** — organize recurring weaknesses by the lines the player actually reaches.
-4. **Human-reference characterization** — process an initial rating-matched public corpus to learn where exact-position evidence is statistically useful.
-5. **Large compressed reference data** — stream `.pgn.zst` data through bounded-memory aggregation rather than fully decompressing the corpus to disk or memory.
-6. **Targeted training** — convert high-priority weaknesses into short, verified exercises.
-7. **Longitudinal follow-up** — observe future opportunities and distinguish real improvement from simply no longer reaching a position.
-
-A later research direction is broader **pattern intelligence**: identifying repeated strategic or tactical mistakes across different exact positions. That work will require validated chess features or similarity methods and is intentionally separate from the exact-position foundation.
-
-## Repository structure
-
-```text
-src/chess_decision_explorer/
-  domain.py          immutable chess-domain value objects
-  aggregation.py     recurrence and outcome aggregation
-  ingestion.py       streaming PGN parsing and decision extraction
-  personal.py        personal cohort classification and indexing
-  engine.py          Stockfish/UCI evaluation boundary
-  engine_cache.py    in-memory + SQLite semantic cache
-  assessment.py      robust move-damage assessment
-
-docs/
-  architecture.md    durable architecture decisions
-  project_state.md   implementation and verification state
-scripts/
-  stockfish_smoke.py             real-engine cache/evaluation smoke test
-  stockfish_assessment_smoke.py  real-engine damage-assessment smoke test
-```
-
-## Running locally
-
-Requirements:
-
-- Python 3.10+
-- a local Stockfish executable for real-engine analysis
-
-Create a virtual environment and install the project:
+Use Python 3.10+; development is on Ubuntu/Linux. From the repository root:
 
 ```bash
 python3 -m venv .venv
@@ -197,39 +67,71 @@ source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
 
-Run the ordinary test suite:
+### Build personal recurrence statistics
 
-```bash
-pytest
+This example reads a local PGN containing the selected player's completed standard-chess games. Replace the path and username with your own:
+
+```python
+from chess_decision_explorer.ingestion import iter_pgn_records
+from chess_decision_explorer.personal import (
+    PersonalAnalysisPolicy,
+    build_personal_analysis,
+)
+
+with open("data/personal/games.pgn", encoding="utf-8") as handle:
+    result = build_personal_analysis(
+        iter_pgn_records(handle, source_id="personal-history"),
+        player_name="YOUR_USERNAME",
+        policy=PersonalAnalysisPolicy(),
+    )
+
+print("Games indexed:", result.totals.total_indexed)
+print("Unique Rapid positions:", len(result.rapid.index))
+for position, stats in result.rapid.index.items():
+    if stats.distinct_game_count >= 2:
+        print(position, "games:", stats.distinct_game_count)
 ```
 
-The standard tests do not require a real Stockfish binary.
+The default cohort policy uses the player's own rating: Rapid ≥ 800, Blitz ≥ 501, and Bullet ≥ 600. Games below those thresholds, with missing ratings, or with unknown time controls are counted separately and excluded from the indexes. This example produces recurrence statistics; weakness ranking is planned.
 
-Run the Step 4A engine/cache smoke test against a local executable:
+### Tests and engine checks
+
+```bash
+python -m pytest
+```
+
+The ordinary suite uses synthetic games and controlled engine evidence to check recurrence accounting, evidence validation, search instability, and cache integrity. Real-engine tests are skipped unless `CDE_STOCKFISH_PATH` is set.
+
+For engine checks, supply a local Stockfish executable with `UCI_ShowWDL` support and its default network. Stockfish is a separate dependency; it is not installed by pip.
 
 ```bash
 python scripts/stockfish_smoke.py /path/to/stockfish
+python scripts/stockfish_assessment_smoke.py /path/to/stockfish
+CDE_STOCKFISH_PATH=/path/to/stockfish python -m pytest tests/test_assessment_stockfish.py
 ```
 
-Run the opt-in Step 4B real-engine integration tests:
+The documented local checks used Stockfish 19 and exercised both player perspectives, forced-move evaluation, cache reuse, and SQLite reopening. The personal pipeline has also been exercised on thousands of real Chess.com games; the [verification notes](docs/project_state.md) record that run. Raw personal PGNs are excluded from Git. These checks establish exercised behavior, while damage-label reliability still requires calibration.
 
-```bash
-CDE_STOCKFISH_PATH=/path/to/stockfish \
-pytest tests/test_assessment_stockfish.py
-```
+## Repository guide
 
-## Design principles
+| Path | Responsibility |
+| --- | --- |
+| `src/chess_decision_explorer/domain.py` | Position, move, decision, and outcome identities |
+| `src/chess_decision_explorer/ingestion.py` | Streaming local PGN parsing and player-decision extraction |
+| `src/chess_decision_explorer/aggregation.py` | Occurrence, distinct-game, choice, and outcome statistics |
+| `src/chess_decision_explorer/personal.py` | Personal eligibility policy and separate time-control cohorts |
+| `src/chess_decision_explorer/engine.py` | UCI lifecycle, canonical requests, and engine-evidence validation |
+| `src/chess_decision_explorer/engine_cache.py` | Shared cache identity and L1 / SQLite persistence |
+| `src/chess_decision_explorer/assessment.py` | Move comparisons, confirmation, and assessment provenance |
+| `scripts/` and `tests/` | Manual engine checks and automated behavioral tests |
 
-A few principles guide the project as it grows:
+See [architecture decisions](docs/architecture.md) for contracts and tradeoffs, and [project state](docs/project_state.md) for implementation and verification notes.
 
-- **Evidence stays attributable.** Personal history, engine analysis, human-reference data, and future training evidence answer different questions.
-- **Expensive computation should be reusable.** Cache identity follows semantics, not filenames or machine paths.
-- **Ambiguous engine evidence may abstain.** Precision is preferred over confidently labeling search noise as a weakness.
-- **Raw data and derived data have different lifecycles.** Personal PGNs and future public corpora remain source data; engine caches and analytical aggregates are derived artifacts.
-- **Scale follows product need.** Streaming, compression, cloud infrastructure, and ML are introduced when a real analytical or product requirement justifies them.
+## Next steps
 
-## Scope
+- Review and calibrate move assessment on real data, including false positives, abstentions, and computational cost.
+- Rank recurring decisions using personal recurrence and admitted engine damage, with source traceability and ingestion deduplication.
+- Add rating-matched human-reference data and opening / repertoire context as separate analytical layers.
+- Generate targeted practice and track performance when those decisions recur in later games.
 
-Chess Decision Explorer is currently an **analysis-core project**, not a finished end-user application. The repository focuses on correctness, reproducibility, and the analytical foundation required before a training UI is built.
-
-That distinction is intentional: the goal is to make the eventual recommendation “study this decision next” explainable from the underlying evidence rather than layering a UI over weak analytics.
+Chess.com API ingestion, a public Lichess corpus pipeline, opening classification, and a training UI are not implemented. Broader pattern analysis across different positions remains a later research direction.
