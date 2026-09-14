@@ -1,14 +1,16 @@
 # Project State
 
-This file records the current implementation and verification state of Chess Decision Explorer. Durable semantics and architectural contracts live in `docs/architecture.md`; the README is the public entry point.
+This file records the current implementation and verification state of Chess Decision Explorer. Durable semantics and architectural contracts live in `docs/architecture.md`, and `docs/statistical_variables.md` is the durable reference for every named quantity and its status (IMPLEMENTED / RESEARCH / FUTURE). The README is the public entry point.
 
 ## Current phase
 
-The latest verified code checkpoint is Step 4B, committed as:
+Step 4B is **complete and architecturally reviewed and accepted**, at:
 
-`c83db1e` — `feat: add robust engine damage assessment`
+`c83db1e75453a51b24dabb3658b31bf1f6b10452` — `feat: add robust engine damage assessment`
 
-Step 4B is **implemented but not production-calibrated**. The assessment procedure, provenance, admission contract, and real-engine checks exist, but production thresholds and search budgets have not been established. An `UNCALIBRATED` policy cannot emit `DAMAGE_SUPPORTED`.
+That is the approved baseline. Acceptance covers the architecture and implementation, not any threshold: Step 4B remains **UNCALIBRATED**. No production epsilon, no tau, no drift thresholds, and no canonical B1/B2/B3 search budgets have been calibrated, so the automatic damaging-move label is not production-approved. An `UNCALIBRATED` policy cannot emit `DAMAGE_SUPPORTED`.
+
+Step 4C.0 — the **calibration-evidence pilot** — is implemented and tested on top of that baseline. It is EXPERIMENTAL infrastructure for generating the evidence a later calibration decision will need, and it calibrates nothing itself. Its runtime/reference benchmark has **not** yet been run, so it has produced no pilot evidence.
 
 Step 4C — personalized ranking that combines recurrence with admitted engine-damage evidence — is **not implemented**. The Step 4B admission contract exists specifically so a future ranking layer cannot promote inconclusive or non-damaging evidence into a weakness claim.
 
@@ -114,13 +116,33 @@ The procedure can return:
 
 The Step 4B result also exposes an admission contract for the future ranking layer. Admission re-checks qualification from recorded evidence/provenance rather than trusting summary fields alone.
 
+### Step 4C.0 — calibration-evidence pilot (experimental)
+
+Implemented an evidence-generation harness under `src/chess_decision_explorer/experimental/c0/`, deliberately outside the production modules. No production module imports it, and it changes no production semantics.
+
+Its single research question is how the low-cost Step 4B measurement `S` differs from much stronger same-root, same-witness analysis. For one sampled canonical decision it records:
+
+- `S` — the conservative accepted loss of the qualifying fixed witness, produced by the existing, unmodified Step 4B procedure;
+- `G_ref_j = U_ref_j(witness) − U_ref_j(observed_move)` at each explicitly supplied stronger reference node budget, from the same canonical root with the same fixed witness.
+
+A pilot run **always** builds an `UNCALIBRATED` Step 4B policy, and there is no switch to change that. Step 4B therefore stays free to answer `INCONCLUSIVE`, no run can emit `DAMAGE_SUPPORTED` or produce an admissible `EngineRegret`, and every recorded `S` is a research measurement re-derived from the recorded trace — never a production damage conclusion.
+
+What C0 deliberately does **not** do: it defines no final `G_reference`, computes no `R = S − G_reference`, freezes no reference protocol, chooses no epsilon or tau, sets no convergence threshold, fits no model, and uses no personal games. It reports the reference trajectory and diagnostics only.
+
+Supporting properties:
+
+- deterministic streaming sampling, one decision per game, with the corpus never materialised; sampled-root identity is `source_id + ':' + zero_based_source_ordinal`, so reproducibility requires the same source id, source ordering/content, seed, and sampling configuration;
+- a run manifest recording code commit, source identity, seed, eligibility filters, engine identity and evidence-contract versions, policy identity and budgets, and the reference ladder;
+- run artefacts are immutable — a run never overwrites an existing run directory, and a replay uses its own run id while sharing one evaluation cache;
+- a `--replay-only` mode that reproduces derived measurements from stored evidence and fails rather than running any engine analysis.
+
 ## Verification
 
 ### Ordinary tests
 
-The checked-in project has a broad synthetic/behavioral pytest suite covering domain semantics, aggregation, ingestion, personal cohorts, engine evidence, cache integrity, and assessment behavior.
+The checked-in project has a broad synthetic/behavioral pytest suite covering domain semantics, aggregation, ingestion, personal cohorts, engine evidence, cache integrity, assessment behavior, and the Step 4C.0 pilot harness.
 
-The ordinary suite does not require a real Stockfish binary.
+The ordinary suite does not require a real Stockfish binary. The C0 tests replace the engine pool with scripted evidence, so sampling, the reference trajectory, the manifest, and the whole CLI output pipeline are exercised without a binary.
 
 ### Real Stockfish checks
 
@@ -135,13 +157,17 @@ Real-engine smoke/integration checks were run against Stockfish 19 during Step 4
 - terminal-position shortcuts and integrity checks;
 - repeated-decision cache reuse.
 
+A separate manual C0 smoke command exercises the pilot end to end against a real engine over a tiny built-in PGN stream, including a `--replay-only` second pass that must reproduce identical derived measurements without running a single engine analysis.
+
 The node budgets and assessment thresholds used by the demonstration scripts are test/demo values, **not production calibration**.
 
 ## Current limitations
 
 The repository does not currently provide:
 
-- calibrated production thresholds or search budgets for Step 4B;
+- calibrated production thresholds or search budgets for Step 4B — no epsilon, tau, drift threshold, or canonical B1/B2/B3 budget exists;
+- a defined `G_reference` or `R`; C0 collects the reference trajectory needed to study them and freezes neither;
+- any measured reliability, false-positive, or abstention rate;
 - Step 4C recurrence × damage ranking;
 - rating-matched human-reference analysis;
 - Chess.com API ingestion beyond local PGN files;
@@ -150,17 +176,22 @@ The repository does not currently provide:
 - a public web/visual interface;
 - cross-position pattern intelligence or ML similarity analysis.
 
+The Step 4C.0 runtime/reference benchmark has not been run, so the actual cost per root at a realistic reference ladder is unmeasured and no pilot evidence exists yet.
+
 The in-memory position index grows with unique retained positions/decisions, and the current L1 engine cache has no eviction policy. PGN parsing is streaming, but the current system should not be described as globally bounded-memory.
 
 ## Data and repository hygiene
 
 - Personal and reference datasets are excluded from Git by `.gitignore`.
 - Generated SQLite engine caches are excluded from Git.
+- All generated Step 4C.0 experiment output (`experiments/`) is disposable computed data and is excluded from Git; the harness code is tracked, its output is not.
 - Smoke scripts take a caller-supplied Stockfish executable path; no local machine path is required by the code.
 - The repository should not contain credentials, tokens, personal PGNs, or private session URLs in tracked files or future commit messages.
 
 ## Next engineering step
 
-Before Step 4C ranking, Step 4B requires review/calibration work on real data, including false positives, abstentions, computational cost, and the production search/threshold policy.
+Run the first Step 4C.0 benchmark: a **5–10-root external Rapid/Blitz pilot**, at `threads = 1` and `hash_mb = 64`, to measure the real cost per root at the intended reference ladder. One Stockfish process is started per bound level and each holds its own hash table, so the configured hash is paid per level rather than once; neither value may be raised until a run's actual memory footprint has been measured.
 
-Only after the admission semantics are trusted should recurrence be used to prioritize damaging decisions for personalized training.
+That benchmark is followed by review before any larger run. Its output is evidence for a later, separate decision about a reference protocol, `G_reference`, and `R` — C0 itself decides none of those.
+
+Step 4B calibration on real data remains the prerequisite for Step 4C ranking, including false positives, abstentions, computational cost, and the production search/threshold policy. Only after the admission semantics are trusted should recurrence be used to prioritize damaging decisions for personalized training.

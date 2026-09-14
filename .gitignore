@@ -16,3 +16,8 @@ data/reference/*
 *.sqlite3-journal
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Step 4C.0 calibration-evidence pilot: ALL generated experiment output is
+# disposable computed data and is never committed. The harness code under
+# src/chess_decision_explorer/experimental/ is tracked; its output is not.
+experiments/
