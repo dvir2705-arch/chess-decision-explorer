@@ -7,10 +7,7 @@ to sanity-check the real engine + cache path end to end:
     .venv/bin/python scripts/stockfish_smoke.py /path/to/stockfish
 
 The executable path is always a command-line argument; no filesystem
-location is hard-coded here or in production code. The locally validated
-development binary during Step 4A was Stockfish, at
-``/home/dvir/tools/stockfish/stockfish/stockfish-linux-x86-64-universal``
-on this machine -- contextual only.
+location is hard-coded here or in production code.
 
 It exercises:
   A. a White-to-move canonical position
