@@ -14,7 +14,11 @@ Step 4C.0 — the **calibration-evidence pilot** — is implemented and tested o
 
 Step 4C — personalized ranking that combines recurrence with admitted engine-damage evidence — is **not implemented**. The Step 4B admission contract exists specifically so a future ranking layer cannot promote inconclusive or non-damaging evidence into a weakness claim.
 
-Human-reference analysis, opening/repertoire context, targeted training, and longitudinal improvement tracking are also future work.
+Step 5C-lite — the **external human reference comparison** — is implemented, tested, and **validated against real Lichess data at 1,000 eligible games**. It compares the player's recurring positions against a streamed corpus of external human games. It is HUMAN evidence and is architecturally separate from the C0/C1 strong-engine reference: it produces and consumes no `G_ref`, `R`, `epsilon`, node budget, or search-noise quantity, and its modules import no engine, assessment, or C0 code.
+
+**Only the 1,000-game validation has been run.** No 10,000-game run and no 500,000-game run has been performed, so the repository makes no claim at those scales.
+
+Opening/repertoire context, targeted training, longitudinal improvement tracking, and rating-matched human cohorts are future work.
 
 ## Implemented milestones
 
@@ -136,6 +140,53 @@ Supporting properties:
 - run artefacts are immutable — a run never overwrites an existing run directory, and a replay uses its own run id while sharing one evaluation cache;
 - a `--replay-only` mode that reproduces derived measurements from stored evidence and fails rather than running any engine analysis.
 
+### Step 5C-lite — external human reference comparison
+
+Implemented a streaming, source-agnostic human-reference pipeline under `src/chess_decision_explorer/human_reference/`, as production architecture rather than an experimental harness.
+
+The pipeline:
+
+1. builds (or loads) the player's recurring `PositionKey`s from **one** personal cohort;
+2. streams an external PGN corpus, accepting exactly a configured number of **eligible** games;
+3. examines the position before every move of an accepted game and keeps statistics **only** for positions already in the target set;
+4. aggregates human move frequencies and actor-relative outcomes into a second, separate `PositionIndex`;
+5. derives a Personal-vs-Reference comparison without mutating either aggregate.
+
+The architectural point is what it does not build. No database of corpus positions exists: a non-target position is discarded the moment it is tested. The invariant is asserted by a test — the reference aggregate never holds more positions than the target set — and measured memory is flat across run sizes.
+
+Supporting properties:
+
+- recurrence is a **distinct personal game** property (v1 default: at least 2), and repeats inside one personal game are never sufficient on their own; occurrence counts and distinct-game counts are both preserved throughout;
+- one cohort per run — the three personal cohort indexes are never merged — and cohort, player, rating, source, and time control are recorded beside the keys, never inside a `PositionKey`;
+- reference outcomes are **actor-relative** to the side to move at the matched position, which `PositionKey` fixes; no White-centric outcome count exists anywhere;
+- the reference aggregate reuses `PositionIndex`, which already gates distinct-game counting with per-call temporary sets, so no external game id is retained in any aggregate;
+- the run target counts **eligible accepted games**, never records scanned; a run that exhausts its input first records `target_met: false` with a shortfall, and says so in the first line of its report;
+- eligibility is configurable and fully recorded — the v1 defaults are exactly standard chess, completed result, rated, Rapid or Blitz, parseable PGN, and nothing more;
+- a run manifest records code commit, source identity and declaration, filters, target/scanned/accepted counts, per-reason rejections, timestamps, the recurrence threshold, the personal cohort, and the `PositionKey` semantics version;
+- `--source-id` is required for a stdin corpus, following the Step 4C.0 precedent;
+- run directories are immutable — a directory already holding artefacts is refused, and there is no `--force`;
+- derived comparisons mutate nothing, ordering is total and deterministic (artefacts are byte-identical across repeated runs), and a rate with a zero denominator is `None`, never `0.0`.
+
+What it deliberately does **not** do: no engine evaluation, no calibration, no ML, no opening classification, no rating matching, no statistical-significance or effect-size claim, and no combination of human evidence with engine evidence into a single score.
+
+Artefacts per run (`reference_manifest.json`, `reference_summary.json`, `positions.csv`, `moves.csv`, `report.md`, `target_set.json`) are written under `reference_runs/` and are gitignored — they are disposable computed data, and `target_set.json` additionally contains the player's own positions.
+
+### Step 5C-lite — real-data validation and header-first scanning
+
+**First real external run** — Lichess `lichess_db_standard_rated_2026-08`, streamed with on-the-fly decompression (`curl | zstd | python`, nothing downloaded to disk). Cohort: Standard, rated, **Rapid only**, both players rated **1200–1400** inclusive, completed result, **human players only**. Personal target set: the maintainer's own Chess.com archive, Rapid cohort, recurrence ≥ 2 distinct personal games. (The player name is a run parameter supplied on the command line; it is not recorded in tracked files.)
+
+Personal target set: 5,128 personal games across 60 files → 3,773 Rapid games seen, 2,961 CORE eligible, 2,960 indexed, 85,576 personal decisions over 73,882 distinct positions → **1,341 recurring positions** (653 White-to-move, 688 Black-to-move) with 2,721 move entries.
+
+Result: **56,977 records scanned, 1,000 eligible games accepted** (`target_met: true`), 60,188 decision positions examined, 4,795 matches (7.97 % match rate), **418 of 1,341 recurring positions covered (31.2 %)**. Rejections: 48,713 wrong time control, 6,836 rating out of band, 220 unrated, **202 bot players**, 6 incomplete result, and **zero** parse or replay failures across 56,977 real records.
+
+Actor-relative outcomes were verified on real matched roots: the 1.d4 pair mirrors exactly (W 93 / D 13 / L 113 for White to move against W 113 / D 13 / L 93 for Black to move over the same 219 games). Every aggregate invariant held with zero violations.
+
+**Human-players-only filter.** Lichess Bot API accounts (`WhiteTitle`/`BlackTitle` == `BOT`) are rejected by default with their own reason; titled humans are never affected. 202 real bot games would otherwise have entered a "human" reference population.
+
+**Header-first scanning.** The first real run exposed a bottleneck synthetic tests could not: the narrow cohort accepted 1.76 % of records, yet every record was fully move-parsed, so ~98 % of parsing work was discarded (measured: `PositionKey` construction 2.7 % of runtime, parsing ~97 %, network/zstd ~1.4 %). Eligibility was therefore split into header-decidable rules and rules needing the reconstructed game, with the former applied before any movetext is tokenised. A single-record tee buffer keeps this working on a non-seekable stdin stream.
+
+Re-running the identical cohort produced **byte-identical `positions.csv`, `moves.csv`, and `target_set.json`**, identical rejection counts by reason, and identical aggregates, at **9.1 s instead of 177.9 s — a 19.6× speedup** (320 → 6,264 records/sec; 5.6 → 110 eligible games/sec). Time now splits as ~46 % header scan over all 56,977 records, ~18 % full parse of the 1,000 survivors, ~36 % replay / `PositionKey` / aggregation. Peak RSS 36.9 MB.
+
 ## Verification
 
 ### Ordinary tests
@@ -143,6 +194,8 @@ Supporting properties:
 The checked-in project has a broad synthetic/behavioral pytest suite covering domain semantics, aggregation, ingestion, personal cohorts, engine evidence, cache integrity, assessment behavior, and the Step 4C.0 pilot harness.
 
 The ordinary suite does not require a real Stockfish binary. The C0 tests replace the engine pool with scripted evidence, so sampling, the reference trajectory, the manifest, and the whole CLI output pipeline are exercised without a binary.
+
+The Step 5C-lite tests are synthetic throughout: every PGN is built in-process or written into a temporary directory, so they need no network, no external corpus, and no engine. They cover exact `PositionKey` matching, discarding of non-target positions, one-pass streaming, the accepted-eligible-games target, input exhaustion before target, Rapid/Blitz filtering, standard/rated/completed filtering, actor-relative outcomes for both White-to-move and Black-to-move roots, draw handling, occurrence vs distinct-game counting, a position repeated inside one external game, move-frequency arithmetic, zero-denominator rates, deterministic ordering, the manifest contract, stdin source identity, and the no-full-corpus-materialisation invariant.
 
 ### Real Stockfish checks
 
@@ -169,7 +222,9 @@ The repository does not currently provide:
 - a defined `G_reference` or `R`; C0 collects the reference trajectory needed to study them and freezes neither;
 - any measured reliability, false-positive, or abstention rate;
 - Step 4C recurrence × damage ranking;
-- rating-matched human-reference analysis;
+- human-reference evidence beyond the single validated 1,000-game Rapid 1200–1400 run: **no 10,000-game or 500,000-game run has been performed**, and no result may be claimed at those scales;
+- a minimum-reference-sample rule: a position matched by 2 reference games prints rates exactly as confidently as one matched by 1,000. Sample counts are exposed beside every rate, and the reportability threshold will be decided after the 10k coverage distribution is seen;
+- rating-matched human-reference cohorts, and any significance or effect-size claim over human reference evidence;
 - Chess.com API ingestion beyond local PGN files;
 - opening or repertoire classification;
 - targeted training generation;
@@ -178,13 +233,14 @@ The repository does not currently provide:
 
 The Step 4C.0 runtime/reference benchmark has not been run, so the actual cost per root at a realistic reference ladder is unmeasured and no pilot evidence exists yet.
 
-The in-memory position index grows with unique retained positions/decisions, and the current L1 engine cache has no eviction policy. PGN parsing is streaming, but the current system should not be described as globally bounded-memory.
+The in-memory position index grows with unique retained positions/decisions, and the current L1 engine cache has no eviction policy. PGN parsing is streaming, but the current system should not be described as globally bounded-memory. The Step 5C-lite reference scan is the one component that *is* bounded by construction — it retains only target positions — and that boundedness does not extend to the personal index it is built from.
 
 ## Data and repository hygiene
 
 - Personal and reference datasets are excluded from Git by `.gitignore`.
 - Generated SQLite engine caches are excluded from Git.
 - All generated Step 4C.0 experiment output (`experiments/`) is disposable computed data and is excluded from Git; the harness code is tracked, its output is not.
+- All generated Step 5C-lite run output (`reference_runs/`) is likewise excluded from Git. It is disposable computed data, and its `target_set.json` contains positions from the player's own games.
 - Smoke scripts take a caller-supplied Stockfish executable path; no local machine path is required by the code.
 - The repository should not contain credentials, tokens, personal PGNs, or private session URLs in tracked files or future commit messages.
 
@@ -195,3 +251,7 @@ Run the first Step 4C.0 benchmark: a **5–10-root external Rapid/Blitz pilot**,
 That benchmark is followed by review before any larger run. Its output is evidence for a later, separate decision about a reference protocol, `G_reference`, and `R` — C0 itself decides none of those.
 
 Step 4B calibration on real data remains the prerequisite for Step 4C ranking, including false positives, abstentions, computational cost, and the production search/threshold policy. Only after the admission semantics are trusted should recurrence be used to prioritize damaging decisions for personalized training.
+
+Separately, and independently of the engine track: Step 5C-lite's **10,000-eligible-game run** is the next step, pending review of the validated 1,000-game result above. Linear extrapolation from the measured header-first run puts 10,000 games at roughly 1.5 minutes and 500,000 at roughly 1.3 hours (~28.5 M records scanned), but those are extrapolations from a single 1,000-game measurement and are not yet validated at either scale. Until a run reports `target_met: true` at a target, the dataset size is whatever `eligible_games_accepted` says and nothing larger may be claimed.
+
+Parallel processing remains **not** justified. The header-first change removed the dominant cost without concurrency; the remaining profile is roughly half header scanning and a third replay/`PositionKey` work. Any further optimisation — including the private-API `_transposition_key()` identity shortcut — is an architectural decision to be taken separately, not an implementation detail.

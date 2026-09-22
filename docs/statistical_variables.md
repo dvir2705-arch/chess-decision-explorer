@@ -99,7 +99,82 @@ nothing.
 | `G_reference` | A single frozen reference gap, once a reference protocol is chosen. **Not defined, not frozen, not chosen.** | FUTURE |
 | `R` | `S − G_reference`. **Deliberately not computed in C0**, because `G_reference` is not frozen. C0 collects the trajectory needed to study it. | FUTURE |
 
-## 7. Explicitly not defined
+## 7. Human reference variables (Step 5C-lite)
+
+Human reference evidence is what **other human players** did in the player's
+own recurring positions. It is a separate architecture from the C0/C1
+strong-engine reference and shares nothing with it but `PositionKey`: no
+`G_ref`, no `R`, no `epsilon`, no node budget, no search-noise quantity.
+
+All of these are facts about two observed populations. None of them is a
+move-quality judgement, and none may be combined with engine evidence into a
+single score without an explicitly approved design.
+
+### Target set
+
+| Symbol / name | Definition | Status |
+| --- | --- | --- |
+| `POSITION_KEY_V1` | The `PositionKey` identity contract matching is performed under: `board.epd(en_passant="legal")`. Recorded in every run manifest; deliberately distinct from `CANONICAL_POSITION_V1`, which is the *engine reconstruction* contract. A target set written under a different value is refused, not silently matched. | IMPLEMENTED |
+| recurring position | A personal position whose **distinct personal game count** is at least `min_distinct_games`. Repeats of the same position inside ONE personal game are not sufficient recurrence by themselves. | IMPLEMENTED |
+| `min_distinct_games` | The recurrence threshold. Configuration on the run, recorded in the manifest. v1 default `2`. | IMPLEMENTED |
+| `personal_cohort` | Which single personal cohort (Rapid / Blitz / Bullet) the target set was built from. One cohort per run; the three cohort indexes are never merged. Metadata beside the keys, never inside a `PositionKey`. | IMPLEMENTED |
+| `primary_move` | The player's most-played move in a recurring position, ties broken by UCI ascending. A reporting anchor — **not** a claim about intended repertoire, preference, or correctness. | IMPLEMENTED |
+
+### Scan accounting
+
+| Symbol / name | Definition | Status |
+| --- | --- | --- |
+| `records_scanned` | Logical PGN records read off the stream, including every rejected one. **Never** the reference dataset size. | IMPLEMENTED |
+| `records_header_rejected` | Records dropped on header evidence alone, whose movetext was never tokenised. | IMPLEMENTED |
+| `records_fully_parsed` | Records that survived header eligibility and were built into a game. Partitions with the previous row: `records_header_rejected + records_fully_parsed == records_scanned`. | IMPLEMENTED |
+| `games_accepted` | ELIGIBLE reference games whose evidence actually entered the aggregate. This — and only this — is the reference dataset size. | IMPLEMENTED |
+| `target_eligible_games` | How many eligible games the run asked for. A request, never an achievement. | IMPLEMENTED |
+| `target_met` | Whether `games_accepted >= target_eligible_games`. False means the run has a smaller dataset than requested and may not be described by its target. | IMPLEMENTED |
+| `shortfall` | `max(0, target_eligible_games - games_accepted)`. | IMPLEMENTED |
+| `scan_termination` | `target_reached` / `stream_exhausted` / `scan_limit_reached`. Anything but `stream_exhausted` makes the accepted games a **declared prefix** of the source, never a random or representative sample of it. | IMPLEMENTED |
+| rejection counts | Per-reason counts: not completed, non-standard variant, not rated, **bot player**, unparseable, time control not eligible, termination excluded, rating missing, rating out of band, too few plies, replay failed, skipped by offset. | IMPLEMENTED |
+| `bot_player` | A side is a Lichess Bot API account (`WhiteTitle`/`BlackTitle` == `BOT`, exact and case-insensitive). Excluded by default: this is a HUMAN cohort. Every other title marks a titled human and is accepted. | IMPLEMENTED |
+| `decisions_examined` / `decisions_matched` | Plies examined in accepted games, and those whose `PositionKey` was in the target set. `match_rate` is their ratio, `None` when nothing was examined. | IMPLEMENTED |
+| `position_coverage_rate` | `matched_positions / target_positions`: the share of the player's recurring positions the corpus reached at all. Not a sample-size guarantee. | IMPLEMENTED |
+
+### Reference evidence
+
+Reference statistics use `PositionIndex` — the same population-agnostic
+aggregation as personal statistics — in its **own instance**. So
+`occurrence_count`, `distinct_game_count`, and `OutcomeCounts` keep exactly
+the definitions in section 2, including the rule that no permanent game-ID
+set is retained.
+
+| Symbol / name | Definition | Status |
+| --- | --- | --- |
+| reference `occurrence_count` | Every matched occurrence, including genuine repeats inside one reference game. | IMPLEMENTED |
+| reference `distinct_game_count` | Counted at most once per reference game per position, and once per reference game per move. A game that repeats a position cannot inflate it. | IMPLEMENTED |
+| actor-relative outcome | The reference game's result as seen by **the side to move at the matched position**. White to move: `1-0` win, `0-1` loss. Black to move: `0-1` win, `1-0` loss. `1/2-1/2` draw either way. `PositionKey` fixes the side to move, so the actor is determined by the key. No White-centric outcome count exists anywhere in the pipeline. | IMPLEMENTED |
+| `reference_move_rate` | Reference move `occurrence_count` / reference position `occurrence_count`. Occurrence based. `None` when the denominator is zero. | IMPLEMENTED |
+| `reference_win_rate` / `draw_rate` / `loss_rate` | Distinct-game based, over `reference_outcome_games` (which equals the move's reference `distinct_game_count`). `None` when the denominator is zero. | IMPLEMENTED |
+| `reference_score_rate` | `(wins + 0.5 * draws) / games`, actor-relative. A *historical human* rate. Never an engine quantity, never a move-quality verdict. | IMPLEMENTED |
+| `reference_rank` | 1-based popularity rank of a move among the reference moves at that position, by occurrence count descending, ties broken by UCI ascending. Equal counts therefore receive distinct consecutive ranks; the counts sit beside the rank so ties stay visible. `None` for a move the reference population never played. | IMPLEMENTED |
+| `reference_top_move` | The reference population's most-played move at that position; `None` when uncovered. | IMPLEMENTED |
+| `reference_covered` | Whether the recurring position occurred at least once in the accepted reference games. | IMPLEMENTED |
+| `reference_move_coverage` | Share of the player's OWN distinct moves at that position that the reference population also played at least once. `None` when uncovered. | IMPLEMENTED |
+| `primary_move_agreement` | Count of covered positions where the player's most-played move is also the reference population's most-played move. A description of agreement between two populations — **not** a correctness rate. | IMPLEMENTED |
+
+### Zero-denominator convention
+
+Every rate in this section is `None` when its denominator is zero, never
+`0.0`. "No reference evidence" and "seen but never chosen" are different
+facts and must not render as the same number.
+
+### Deliberately not defined by this milestone
+
+| Symbol / name | Status |
+| --- | --- |
+| statistical significance, p-values, confidence intervals, effect sizes over reference evidence | FUTURE — **not defined, not computed** |
+| rating-matched reference cohorts | FUTURE |
+| minimum reference sample size for a position to be reportable | FUTURE |
+| any combination of human reference evidence with engine evidence into one score | FUTURE |
+
+## 8. Explicitly not defined
 
 The following have no definition, no implementation, and no data:
 
@@ -108,7 +183,9 @@ The following have no definition, no implementation, and no data:
 - `G_reference` and `R`
 - a weighted combination of engine, reference-population, and personal
   historical evidence
-- reference-population (Lichess) statistics
+- rating-matched reference-population statistics, and any significance or
+  effect-size claim over human reference evidence (section 7 defines the
+  observed-frequency and observed-outcome quantities only)
 - opening identity as a statistical dimension (opening identity must stay
   separate from `PositionKey`)
 - any machine-learned model or fitted parameter

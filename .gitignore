@@ -21,3 +21,10 @@ data/reference/*
 # disposable computed data and is never committed. The harness code under
 # src/chess_decision_explorer/experimental/ is tracked; its output is not.
 experiments/
+
+# Step 5C-lite human-reference runs: ALL generated run output is disposable
+# computed data and is never committed. It also contains the player's own
+# recurring positions (target_set.json), which are personal data. The
+# pipeline code under src/chess_decision_explorer/human_reference/ is
+# tracked; its output is not.
+reference_runs/

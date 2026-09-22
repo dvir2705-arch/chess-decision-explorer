@@ -6,7 +6,7 @@ The unit of analysis is a **decision: the position before a move, paired with th
 
 **Implemented:** streaming local PGN ingestion, recurring-position statistics, separate Rapid / Blitz / Bullet cohorts, Stockfish evaluation through UCI, an in-memory / SQLite evaluation cache, and a multi-stage move-assessment procedure.
 
-**Current boundary:** move assessment still needs calibration and review. Recurrence-based weakness ranking, rating-matched human comparisons, and training are future work. The repository currently exposes Python APIs and engine smoke scripts.
+**Current boundary:** move assessment still needs calibration and review. A streaming comparison against external human games is implemented but has not been run at scale, so no human-reference evidence exists yet. Recurrence-based weakness ranking, rating-matched human cohorts, and training are future work. The repository currently exposes Python APIs, a human-reference CLI, and engine smoke scripts.
 
 ## Data flow
 

@@ -53,9 +53,10 @@ chess rules, board representation, and PGN handling.
 
 ## 6. Reference data will be processed as streams
 
-Reference datasets are expected to be large. They will eventually be
-processed as streams rather than loaded entirely into memory. The streaming
-approach itself has not been designed yet.
+Reference datasets are expected to be large. They are processed as streams
+rather than loaded entirely into memory. Step 5C-lite implements this for
+human reference evidence (see *Human reference comparison* below); the same
+principle applies to any future reference source.
 
 ## Domain model
 
@@ -792,6 +793,126 @@ budgets and thresholds in `tests/test_assessment_stockfish.py` and
 `scripts/stockfish_assessment_smoke.py` are demonstration fixtures labelled
 as such, never production configuration.
 
+## Human reference comparison (Step 5C-lite)
+
+Human reference evidence answers a different question from engine evidence:
+not "how good is this move" but "what did other humans play here, and how did
+those games end". The two are separate architectures that share only
+`PositionKey`. Nothing in the human-reference pipeline produces or consumes
+`G_ref`, `R`, `epsilon`, a node budget, or any search-noise quantity, and it
+never imports the engine, assessment, or Step 4C.0 modules.
+
+### The target set bounds the work
+
+The external corpus may hold tens of millions of decision positions. None of
+them is stored. The player's recurring positions are selected first, and the
+scan keeps statistics only for `PositionKey`s already in that set:
+
+```
+personal recurring positions -> small target PositionKey set
+    -> stream external games
+        -> for each decision:
+             PositionKey not in target set -> discard
+             PositionKey in target set     -> aggregate
+```
+
+Memory therefore scales with the personal target set and the moves matched
+inside it, never with corpus size. The invariant is checkable: the reference
+aggregate never holds more positions than the target set.
+
+### Recurrence is a distinct-game property
+
+A position is recurring when at least N **distinct personal games** contain
+it (v1 default: 2). Repeats of the same position inside one game are not
+sufficient recurrence by themselves. Occurrence counts and distinct-game
+counts are both preserved everywhere and are never substituted for each
+other.
+
+### The reference aggregate is the same index, a separate instance
+
+Reference statistics use `PositionIndex`, the same population-agnostic
+aggregation as personal statistics, in its own instance. Personal and
+reference statistics are never merged. This reuse also supplies the
+per-game distinct counting and the guarantee that no permanent game-ID set
+is retained: a reference game's id exists only inside the one `add_game`
+call that consumes it.
+
+### A human reference cohort excludes bot accounts
+
+Lichess marks Bot API accounts with `WhiteTitle`/`BlackTitle` equal to `BOT`.
+Those games are engine-driven and are not human evidence, so they are
+rejected by default with their own reason. The rule matches the `BOT` title
+exactly and case-insensitively; every other title (GM, IM, FM, NM, WGM, …)
+marks a titled HUMAN and is accepted normally.
+
+### Reference outcomes are actor-relative
+
+`PositionKey` includes the side to move, so a matched reference position has
+the same actor as the personal position. Every reference win/draw/loss is
+recorded relative to that side. No White-centric outcome count exists
+anywhere in the pipeline.
+
+### One cohort per run
+
+The three personal cohort indexes are never merged, so one run compares
+exactly one cohort and records which one. Cohort, player identity, rating,
+source, opening, and time control are recorded as metadata beside the keys
+and are never folded into `PositionKey`.
+
+### Header-first scanning
+
+Eligibility splits into rules decidable from PGN header text and rules that
+genuinely need the reconstructed game. Header-decidable rules — completed
+result, standard variant, rated event, human players (no Lichess Bot API
+account), time-control category, rating-header well-formedness, rating
+presence and band, configured termination exclusion — are applied FIRST, and
+a record failing one is dropped before its movetext is tokenised. Only
+movetext validity, starting-position validity, ply count, and legal replay
+remain on the post-parse path.
+
+This matters because a narrow reference cohort accepts a small fraction of a
+public corpus: the first real Lichess run accepted 1.76 % of records, so
+parsing every record in full spent ~98 % of the work on records that were
+then discarded.
+
+`chess.pgn.read_headers` consumes a whole record and its documented usage
+requires `seek()` afterwards, which a `curl | zstd | python` stream cannot
+do. The scanner therefore tees the lines python-chess reads into a
+single-record buffer and re-parses an accepted record from it. Record
+boundaries stay python-chess's own in both phases, at most one record's raw
+text is held, the pass over the source stays single and forward-only, and
+file and stdin sources behave identically.
+
+**Semantic boundary.** A record failing both a header rule and a movetext
+rule is attributed to the header reason, because its movetext is never read.
+The accepted population is unchanged — such a record was rejected either way
+— but the recorded reason can move from a parse reason to a header reason.
+The relative order of header-decidable rules is preserved exactly, including
+the rating-header well-formedness check, which precedes the time-control
+test and still reports as a parse rejection.
+
+### Accepted eligible games, not records scanned
+
+A run's target is a count of **eligible accepted** games. The number of
+records read off the stream is a different quantity and is reported
+separately. A run that exhausts its input before reaching its target records
+`target_met: false` and a shortfall, and its report says so in its first
+line. A target is never reported as an achievement.
+
+### Comparison is derived, never stored back
+
+Personal-vs-reference rows are derived from the two aggregates and mutate
+neither, so a comparison can be rebuilt, or rebuilt differently, without
+rescanning the corpus. A rate with a zero denominator is undefined (`None`),
+never `0.0`.
+
+### What this milestone does not decide
+
+It defines no statistical-significance test, no effect size, no rating
+matching, and no combination of human evidence with engine evidence. A
+difference between a personal rate and a reference rate describes two
+populations; it is not a claim that a move is good or bad.
+
 ## Out of scope for now
 
 The following are known future directions but are explicitly not part of
@@ -800,7 +921,9 @@ the current foundation and have no design yet:
 - Calibrated production thresholds for Step 4B (epsilon, tau, drift
   limits, B1/B2/B3 budgets) and any measured reliability claim
 - Step 4C: recurring-weakness ranking / Top-K over accepted engine damage
-- Reference-corpus (Lichess) ingestion
+- Rating-matched human reference cohorts, and any statistical-significance
+  or effect-size claim over human reference evidence
+- Combining human reference evidence with engine evidence into one score
 - Opening classification
 - Parallel processing
 - A persistent database beyond the disposable engine evaluation cache
