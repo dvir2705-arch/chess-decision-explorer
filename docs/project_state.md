@@ -14,9 +14,9 @@ Step 4C.0 — the **calibration-evidence pilot** — is implemented and tested o
 
 Step 4C — personalized ranking that combines recurrence with admitted engine-damage evidence — is **not implemented**. The Step 4B admission contract exists specifically so a future ranking layer cannot promote inconclusive or non-damaging evidence into a weakness claim.
 
-Step 5C-lite — the **external human reference comparison** — is implemented, tested, and **validated against real Lichess data at 1,000 eligible games**. It compares the player's recurring positions against a streamed corpus of external human games. It is HUMAN evidence and is architecturally separate from the C0/C1 strong-engine reference: it produces and consumes no `G_ref`, `R`, `epsilon`, node budget, or search-noise quantity, and its modules import no engine, assessment, or C0 code.
+Step 5C-lite — the **external human reference comparison** — is **COMPLETE as Human Reference V1**. It compares the player's recurring positions against a streamed corpus of external human games, and the production corpus has been run: **500,000 eligible accepted games**, validated at 1,000 and 10,000 first. Full details in `docs/human_reference_v1_results.md`.
 
-**Only the 1,000-game validation has been run.** No 10,000-game run and no 500,000-game run has been performed, so the repository makes no claim at those scales.
+It is HUMAN evidence and is architecturally separate from the C0/C1 strong-engine reference: it produces and consumes no `G_ref`, `R`, `epsilon`, node budget, or search-noise quantity, and its modules import no engine, assessment, or C0 code. Human popularity and human outcome rates are **descriptive evidence about what a population of players did** — they are not move-quality evidence and are never interchangeable with engine evaluation.
 
 Opening/repertoire context, targeted training, longitudinal improvement tracking, and rating-matched human cohorts are future work.
 
@@ -171,7 +171,7 @@ What it deliberately does **not** do: no engine evaluation, no calibration, no M
 
 Artefacts per run (`reference_manifest.json`, `reference_summary.json`, `positions.csv`, `moves.csv`, `report.md`, `target_set.json`) are written under `reference_runs/` and are gitignored — they are disposable computed data, and `target_set.json` additionally contains the player's own positions.
 
-### Step 5C-lite — real-data validation and header-first scanning
+### Step 5C-lite — Human Reference V1 (COMPLETE)
 
 **First real external run** — Lichess `lichess_db_standard_rated_2026-08`, streamed with on-the-fly decompression (`curl | zstd | python`, nothing downloaded to disk). Cohort: Standard, rated, **Rapid only**, both players rated **1200–1400** inclusive, completed result, **human players only**. Personal target set: the maintainer's own Chess.com archive, Rapid cohort, recurrence ≥ 2 distinct personal games. (The player name is a run parameter supplied on the command line; it is not recorded in tracked files.)
 
@@ -186,6 +186,28 @@ Actor-relative outcomes were verified on real matched roots: the 1.d4 pair mirro
 **Header-first scanning.** The first real run exposed a bottleneck synthetic tests could not: the narrow cohort accepted 1.76 % of records, yet every record was fully move-parsed, so ~98 % of parsing work was discarded (measured: `PositionKey` construction 2.7 % of runtime, parsing ~97 %, network/zstd ~1.4 %). Eligibility was therefore split into header-decidable rules and rules needing the reconstructed game, with the former applied before any movetext is tokenised. A single-record tee buffer keeps this working on a non-seekable stdin stream.
 
 Re-running the identical cohort produced **byte-identical `positions.csv`, `moves.csv`, and `target_set.json`**, identical rejection counts by reason, and identical aggregates, at **9.1 s instead of 177.9 s — a 19.6× speedup** (320 → 6,264 records/sec; 5.6 → 110 eligible games/sec). Time now splits as ~46 % header scan over all 56,977 records, ~18 % full parse of the 1,000 survivors, ~36 % replay / `PositionKey` / aggregation. Peak RSS 36.9 MB.
+
+**Human Reference V1 — final production corpus.** Run at commit `17d534a250086e2e9b0b75265befda0468ac4847` with `code_tree_dirty: false`, reusing the byte-identical target set from the 1k and 10k runs.
+
+Cohort: Lichess `lichess_db_standard_rated_2026-08` — Standard, rated, **Rapid only**, **both players rated 1200–1400 inclusive**, completed result, **human players only** (Lichess Bot API accounts excluded).
+
+| metric | value |
+| --- | --- |
+| eligible games accepted | **500,000** (`target_met: true`, shortfall 0) |
+| records scanned | 22,666,625 |
+| records header-rejected / fully parsed | 22,166,350 / 500,275 |
+| decision positions examined | 31,101,977 |
+| matched decisions | 2,495,954 (8.03 % match rate) |
+| recurring positions covered | **1,287 / 1,341 (95.97 %)** |
+| reference distinct games / occurrences | 2,495,923 / 2,495,954 (31 within-game repeats) |
+| reference W / D / L | 1,199,984 / 97,006 / 1,198,933 |
+| runtime | **65.1 minutes** |
+| peak RSS | **54.6 MB** |
+| parse / replay failures | **0** across 22,666,625 records |
+
+Every aggregate invariant held with zero violations, and actor-relative outcomes mirror exactly at scale — the aggregate score rate over all positions is 0.5002, as it must be when wins and losses are counted from both sides. Memory grew only 41.7 → 54.6 MB from 10k to 500k games, confirming the bound is the target set rather than corpus size.
+
+**Stability finding (input to a future reportability rule).** Comparing the 10k and 500k outputs over the 874 positions covered in both: `reference_top_move` changed for 292 (33.4 %) and the personal primary move's rank changed for 445 (50.9 %). Instability falls monotonically with sample size — 48.0 % of top-moves flipped among positions holding 1–4 reference games at 10k, against 0 % among those holding 500 or more. **No minimum-sample threshold has been chosen or implemented**; sample counts remain exposed beside every rate.
 
 ## Verification
 
@@ -222,8 +244,9 @@ The repository does not currently provide:
 - a defined `G_reference` or `R`; C0 collects the reference trajectory needed to study them and freezes neither;
 - any measured reliability, false-positive, or abstention rate;
 - Step 4C recurrence × damage ranking;
-- human-reference evidence beyond the single validated 1,000-game Rapid 1200–1400 run: **no 10,000-game or 500,000-game run has been performed**, and no result may be claimed at those scales;
-- a minimum-reference-sample rule: a position matched by 2 reference games prints rates exactly as confidently as one matched by 1,000. Sample counts are exposed beside every rate, and the reportability threshold will be decided after the 10k coverage distribution is seen;
+- human-reference evidence beyond the single completed cohort (Lichess 2026-08, Rapid, 1200–1400, human-only): no other month, time control, or rating band has been run, and the accepted games are a declared prefix of that month rather than a random sample of it;
+- a minimum-reference-sample rule: a position matched by 2 reference games still prints rates exactly as confidently as one matched by 100,000. Sample counts are exposed beside every rate; the 10k→500k stability evidence needed to choose a threshold now exists, but no threshold has been chosen;
+- any statistical-significance, effect-size, or rating-matched-control claim over human reference evidence;
 - rating-matched human-reference cohorts, and any significance or effect-size claim over human reference evidence;
 - Chess.com API ingestion beyond local PGN files;
 - opening or repertoire classification;
@@ -252,6 +275,8 @@ That benchmark is followed by review before any larger run. Its output is eviden
 
 Step 4B calibration on real data remains the prerequisite for Step 4C ranking, including false positives, abstentions, computational cost, and the production search/threshold policy. Only after the admission semantics are trusted should recurrence be used to prioritize damaging decisions for personalized training.
 
-Separately, and independently of the engine track: Step 5C-lite's **10,000-eligible-game run** is the next step, pending review of the validated 1,000-game result above. Linear extrapolation from the measured header-first run puts 10,000 games at roughly 1.5 minutes and 500,000 at roughly 1.3 hours (~28.5 M records scanned), but those are extrapolations from a single 1,000-game measurement and are not yet validated at either scale. Until a run reports `target_met: true` at a target, the dataset size is whatever `eligible_games_accepted` says and nothing larger may be claimed.
+Separately, and independently of the engine track: **Human Reference V1 is complete** and needs no further run. The open decision it leaves behind is the **reportability threshold** — the minimum reference sample size at which a position's popularity and outcome rates may be presented. The 10k→500k stability evidence required to choose one is recorded in `docs/human_reference_v1_results.md`; choosing it is a product decision, not an implementation detail.
+
+The rule that governs any claim remains: the dataset size is whatever `eligible_games_accepted` reports, never the target requested.
 
 Parallel processing remains **not** justified. The header-first change removed the dominant cost without concurrency; the remaining profile is roughly half header scanning and a third replay/`PositionKey` work. Any further optimisation — including the private-API `_transposition_key()` identity shortcut — is an architectural decision to be taken separately, not an implementation detail.
